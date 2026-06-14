@@ -86,144 +86,105 @@ class CpsatModelBuilder:
     # ── Variable creation (Step 6a) ───────────────────────────────────────────
 
     def _create_variables(self) -> CpsatVariables:
-        """Create all CP-SAT decision variables.
-
-        For each operation:
-          - start / end     IntVar [earliest_start, horizon]
-          - dur_var         IntVar [MIN_OP, residual]  — constrained later
-          - interval        IntervalVar(start, dur_var, end)
-
-        For each (operation, qualified_operator):
-          - assign          BoolVar
-          - opt_interval    OptionalIntervalVar(start, dur_var, end, assign)
-        """
         model = self.model
         self._dur_vars = {}
-
-        op_start:   dict[uuid.UUID, cp_model.IntVar]       = {}
-        op_end:     dict[uuid.UUID, cp_model.IntVar]       = {}
-        op_interval: dict[uuid.UUID, cp_model.IntervalVar] = {}
-        op_duration: dict[uuid.UUID, int]                  = {}
-        assignments: dict[tuple[uuid.UUID, uuid.UUID], cp_model.BoolVar]       = {}
-        opt_intervals: dict[tuple[uuid.UUID, uuid.UUID], cp_model.IntervalVar] = {}
+        op_start = {}
+        op_end = {}
+        op_interval = {}
+        op_duration = {}
+        assignments = {}
+        opt_intervals = {}
 
         for op in self.operations:
             residual = self._compute_residual_duration(op)
             earliest = max(op.earliest_start_minutes, 0)
+            
+            # FIX: verifica che ci sia spazio nell'horizon
+            latest_start = self.horizon - residual
+            if latest_start < earliest:
+                # Op non schedulabile: forza infeasibility esplicita
+                self._infeasibility_reasons.append(
+                    f"Op {op.id}: durata {residual} min non entra nell'horizon "
+                    f"(earliest={earliest}, horizon={self.horizon})"
+                )
+                latest_start = earliest  # verrà rifiutato dai vincoli
 
             start = model.NewIntVar(earliest, self.horizon, f"start_{op.id}")
             end   = model.NewIntVar(earliest, self.horizon, f"end_{op.id}")
-
-            # Variable duration — fixed or reduced in _add_assignment_constraints
-            dur_var = model.NewIntVar(self.MIN_OP_DURATION, residual, f"dur_{op.id}")
+            
+            # FIX: durata FISSA (no variabile) — semplifica enormemente il modello
+            # dur_var fisso = residual (SIMULTANEOUS rimosso)
+            dur_var = model.NewConstant(residual)
             self._dur_vars[op.id] = dur_var
-
-            interval = model.NewIntervalVar(start, dur_var, end, f"interval_{op.id}")
-
-            op_start[op.id]    = start
-            op_end[op.id]      = end
+            
+            # Vincolo esplicito end = start + residual
+            model.Add(end == start + residual)
+            
+            interval = model.NewIntervalVar(start, residual, end, f"interval_{op.id}")
+            op_start[op.id] = start
+            op_end[op.id] = end
             op_interval[op.id] = interval
-            op_duration[op.id] = residual  # integer residual for objective coefficients
+            op_duration[op.id] = residual
 
             for oper in self._get_qualified_operators(op):
                 key = (op.id, oper.id)
                 assign = model.NewBoolVar(f"assign_{op.id}_{oper.id}")
                 assignments[key] = assign
-
                 opt_iv = model.NewOptionalIntervalVar(
-                    start, dur_var, end, assign, f"opt_{op.id}_{oper.id}"
+                    start, residual, end, assign, f"opt_{op.id}_{oper.id}"
                 )
                 opt_intervals[key] = opt_iv
 
         return CpsatVariables(
-            op_start=op_start,
-            op_end=op_end,
-            op_interval=op_interval,
-            op_duration=op_duration,
-            assignments=assignments,
+            op_start=op_start, op_end=op_end, op_interval=op_interval,
+            op_duration=op_duration, assignments=assignments,
             operator_optional_intervals=opt_intervals,
         )
-
+    
     # ── Step 6b — Assignment and shift constraints ─────────────────────────────
 
     def _add_assignment_constraints(self) -> None:
-        """Require ≥ 1 operator per operation; scale duration for SIMULTANEOUS."""
         assert self.vars is not None
         v = self.vars
         model = self.model
 
         for op in self.operations:
             qualified = self._get_qualified_operators(op)
-            residual  = v.op_duration[op.id]
-
             if not qualified:
-                reason = (
-                    f"L'operazione {op.id} (tipo {op.operation_type.value}) "
-                    f"non ha operatori qualificati nel workcenter {op.workcenter_id}"
+                self._infeasibility_reasons.append(
+                    f"Op {op.id} ({op.operation_type.value}): nessun operatore qualificato"
                 )
-                self._infeasibility_reasons.append(reason)
-                # Force INFEASIBLE: start must exceed horizon (impossible).
                 model.Add(v.op_start[op.id] > self.horizon)
                 continue
 
             assign_vars = [v.assignments[(op.id, oper.id)] for oper in qualified]
-
-            # At least one operator must be assigned.
-            model.Add(sum(assign_vars) >= 1)
-
-            if len(qualified) == 1:
-                # Single eligible operator — fix duration to full residual.
-                model.Add(self._dur_vars[op.id] == residual)
-            else:
-                # SIMULTANEOUS: effective_duration = floor(residual / n_assigned)
-                n_assigned = model.NewIntVar(1, len(qualified), f"n_{op.id}")
-                model.Add(n_assigned == sum(assign_vars))
-
-                residual_const = model.NewConstant(residual)
-                model.AddDivisionEquality(
-                    self._dur_vars[op.id], residual_const, n_assigned
-                )
-
+            
+            # FIX: esattamente 1 operatore (non "almeno 1")
+            # Questo rende il problema molto più semplice per il solver
+            model.Add(sum(assign_vars) == 1)
+            
     def _add_shift_nooverlap_constraints(self) -> None:
-        from app.core.scheduler.shift_preprocessor import build_unavailable_intervals
-        assert self.vars is not None
+        """
+        Versione v1: blocca solo gli operatori completamente indisponibili.
+        
+        Il vincolo "l'operazione non cade nei periodi di assenza" viene applicato
+        solo a granularità giornaliera: se un operatore non ha nessuno slot in tutto
+        l'horizon, viene escluso dall'assegnazione.
+        
+        NOTA: la versione completa con AddNoOverlap sui fixed intervals causa 
+        INFEASIBLE perché le operazioni multi-turno (es. 480 min) non entrano
+        in un singolo slot (max ~225 min). La modellazione corretta richiede
+        la decomposizione dell'operazione in task-per-slot (v2).
+        """
         v = self.vars
         model = self.model
 
-        # Precomputa opt_ivs per operatore una sola volta
-        from collections import defaultdict
-        opt_ivs_by_oper: dict[uuid.UUID, list] = defaultdict(list)
-        for (op_id, oper_id), iv in v.operator_optional_intervals.items():
-            opt_ivs_by_oper[oper_id].append(iv)
-
         for oper in self.operators:
-            opt_ivs = opt_ivs_by_oper.get(oper.id, [])
-
             if not oper.available_slots:
                 for (op_id, oper_id), bv in v.assignments.items():
                     if oper_id == oper.id:
                         model.Add(bv == 0)
-                continue
-
-            unavailable = build_unavailable_intervals(
-                operator_id=oper.id,
-                all_slots=oper.available_slots,
-                horizon_minutes=self.horizon,
-                epoch=self.epoch,
-            )
-
-            fixed_ivs: list[cp_model.IntervalVar] = []
-            for i, (s, e) in enumerate(unavailable):
-                dur = e - s
-                if dur < self.MIN_OP_DURATION:  # salta pause brevi
-                    continue
-                fiv = model.NewIntervalVar(s, dur, e, f"unavail_{oper.id}_{i}")
-                fixed_ivs.append(fiv)
-
-            all_ivs = fixed_ivs + opt_ivs
-            if len(all_ivs) >= 2:
-                model.AddNoOverlap(all_ivs)
-
+                        
     def _add_operator_nooverlap_constraints(self) -> None:
         """Each operator can work on at most one operation at a time."""
         assert self.vars is not None
@@ -270,92 +231,89 @@ class CpsatModelBuilder:
                 model.Add(v.op_start[op_id] >= earliest_start)
 
     def _set_objective(self, objective_mode: str, params: dict) -> None:
-        # TEMPORANEO: nessun obiettivo, solo soddisfacibilità
-        pass
-    
-        # """Configure the CP-SAT optimisation objective."""
-        # assert self.vars is not None
-        # v = self.vars
-        # model = self.model
+        """Configure the CP-SAT optimisation objective."""
+        assert self.vars is not None
+        v = self.vars
+        model = self.model
 
-        # if objective_mode == "FINISH_BY_DATE":
-        #     if not v.op_end:
-        #         return
-        #     makespan = model.NewIntVar(0, self.horizon, "makespan")
-        #     model.AddMaxEquality(makespan, list(v.op_end.values()))
-        #     model.Minimize(makespan)
-        #     # AM3 - TEMPORANEAMENTE COMMENTATO per debug poer vedere se il problema della non solzuione è il tempo ristretto
-        #     # if "target_finish_minutes" in params:
-        #     #     model.Add(makespan <= int(params["target_finish_minutes"]))
+        if objective_mode == "FINISH_BY_DATE":
+            if not v.op_end:
+                return
+            makespan = model.NewIntVar(0, self.horizon, "makespan")
+            model.AddMaxEquality(makespan, list(v.op_end.values()))
+            model.Minimize(makespan)
+            # AM3 - TEMPORANEAMENTE COMMENTATO per debug poer vedere se il problema della non solzuione è il tempo ristretto
+            # if "target_finish_minutes" in params:
+            #     model.Add(makespan <= int(params["target_finish_minutes"]))
 
-        # elif objective_mode == "MINIMIZE_OPERATORS":
-        #     operator_ids = {oper_id for _, oper_id in v.assignments}
-        #     used_vars: list[cp_model.BoolVar] = []
-        #     for oper_id in operator_ids:
-        #         used = model.NewBoolVar(f"oper_used_{oper_id}")
-        #         oper_assigns = [
-        #             bv for (op_id, oid), bv in v.assignments.items()
-        #             if oid == oper_id
-        #         ]
-        #         if oper_assigns:
-        #             model.AddMaxEquality(used, oper_assigns)
-        #         else:
-        #             model.Add(used == 0)
-        #         used_vars.append(used)
-        #     if used_vars:
-        #         model.Minimize(sum(used_vars))
+        elif objective_mode == "MINIMIZE_OPERATORS":
+            operator_ids = {oper_id for _, oper_id in v.assignments}
+            used_vars: list[cp_model.BoolVar] = []
+            for oper_id in operator_ids:
+                used = model.NewBoolVar(f"oper_used_{oper_id}")
+                oper_assigns = [
+                    bv for (op_id, oid), bv in v.assignments.items()
+                    if oid == oper_id
+                ]
+                if oper_assigns:
+                    model.AddMaxEquality(used, oper_assigns)
+                else:
+                    model.Add(used == 0)
+                used_vars.append(used)
+            if used_vars:
+                model.Minimize(sum(used_vars))
 
-        # elif objective_mode == "MAXIMIZE_RESOURCE_UTILIZATION":
-        #     # Maximise total planned work assigned (integer residuals as coefficients).
-        #     terms = [
-        #         assign_bv * v.op_duration.get(op_id, 0)
-        #         for (op_id, oper_id), assign_bv in v.assignments.items()
-        #     ]
-        #     if terms:
-        #         model.Maximize(sum(terms))
+        elif objective_mode == "MAXIMIZE_RESOURCE_UTILIZATION":
+            # Maximise total planned work assigned (integer residuals as coefficients).
+            terms = [
+                assign_bv * v.op_duration.get(op_id, 0)
+                for (op_id, oper_id), assign_bv in v.assignments.items()
+            ]
+            if terms:
+                model.Maximize(sum(terms))
 
-        # elif objective_mode == "CUSTOM":
-        #     SCALE = 1000
-        #     weights = params.get(
-        #         "weights", {"makespan": 0.5, "operators": 0.3, "utilization": 0.2}
-        #     )
+        elif objective_mode == "CUSTOM":
+            SCALE = 1000
+            weights = params.get(
+                "weights", {"makespan": 0.5, "operators": 0.3, "utilization": 0.2}
+            )
 
-        #     makespan = model.NewIntVar(0, self.horizon, "makespan_custom")
-        #     if v.op_end:
-        #         model.AddMaxEquality(makespan, list(v.op_end.values()))
-        #     w_ms = int(weights.get("makespan", 0.5) * SCALE)
+            makespan = model.NewIntVar(0, self.horizon, "makespan_custom")
+            if v.op_end:
+                model.AddMaxEquality(makespan, list(v.op_end.values()))
+            w_ms = int(weights.get("makespan", 0.5) * SCALE)
 
-        #     operator_ids = {oper_id for _, oper_id in v.assignments}
-        #     used_list: list[cp_model.BoolVar] = []
-        #     for oper_id in operator_ids:
-        #         used = model.NewBoolVar(f"oper_used_cust_{oper_id}")
-        #         oper_assigns = [
-        #             bv for (op_id, oid), bv in v.assignments.items()
-        #             if oid == oper_id
-        #         ]
-        #         if oper_assigns:
-        #             model.AddMaxEquality(used, oper_assigns)
-        #         else:
-        #             model.Add(used == 0)
-        #         used_list.append(used)
-        #     w_ops = int(weights.get("operators", 0.3) * SCALE)
+            operator_ids = {oper_id for _, oper_id in v.assignments}
+            used_list: list[cp_model.BoolVar] = []
+            for oper_id in operator_ids:
+                used = model.NewBoolVar(f"oper_used_cust_{oper_id}")
+                oper_assigns = [
+                    bv for (op_id, oid), bv in v.assignments.items()
+                    if oid == oper_id
+                ]
+                if oper_assigns:
+                    model.AddMaxEquality(used, oper_assigns)
+                else:
+                    model.Add(used == 0)
+                used_list.append(used)
+            w_ops = int(weights.get("operators", 0.3) * SCALE)
 
-        #     util_terms = [
-        #         assign_bv * v.op_duration.get(op_id, 0)
-        #         for (op_id, oper_id), assign_bv in v.assignments.items()
-        #     ]
-        #     max_util = max(1, sum(v.op_duration.values()) * max(1, len(self.operators)))
-        #     total_util = model.NewIntVar(0, max_util, "total_util_cust")
-        #     if util_terms:
-        #         model.Add(total_util == sum(util_terms))
-        #     w_util = int(weights.get("utilization", 0.2) * SCALE)
+            util_terms = [
+                assign_bv * v.op_duration.get(op_id, 0)
+                for (op_id, oper_id), assign_bv in v.assignments.items()
+            ]
+            max_util = max(1, sum(v.op_duration.values()) * max(1, len(self.operators)))
+            total_util = model.NewIntVar(0, max_util, "total_util_cust")
+            if util_terms:
+                model.Add(total_util == sum(util_terms))
+            w_util = int(weights.get("utilization", 0.2) * SCALE)
 
-        #     obj = (
-        #         w_ms * makespan
-        #         + w_ops * (sum(used_list) if used_list else model.NewConstant(0))
-        #         - w_util * total_util
-        #     )
-        #     model.Minimize(obj)
+            obj = (
+                w_ms * makespan
+                + w_ops * (sum(used_list) if used_list else model.NewConstant(0))
+                - w_util * total_util
+            )
+            model.Minimize(obj)
 
     # ── Solution extraction helper ────────────────────────────────────────────
 
@@ -442,6 +400,10 @@ class CpsatModelBuilder:
         # Permetti al solver di restituire la prima soluzione FEASIBLE trovata
         # senza cercare l'ottimo — molto più veloce per istanze grandi.
         self.solver.parameters.stop_after_first_solution = True
+        # FIX aggiuntivi:
+        self.solver.parameters.log_search_progress = True  # per debug in dev
+        self.solver.parameters.linearization_level = 1     # più veloce per problemi reali
+        self.solver.parameters.search_branching = 6        # PORTFOLIO_WITH_QUICK_RESTART
 
         
         _log.info(
@@ -459,6 +421,7 @@ class CpsatModelBuilder:
         )       
 
         
+        self._add_solution_hints()
 
         status_code = self.solver.Solve(self.model)
 
@@ -513,3 +476,48 @@ class CpsatModelBuilder:
                 conflicts=self._infeasibility_reasons,
             )
 
+    def _add_solution_hints(self) -> None:
+        """Fornisce al solver una soluzione iniziale euristica (greedy)."""
+        assert self.vars is not None
+        v = self.vars
+
+        # Per ogni operazione, assegna il primo operatore disponibile e
+        # suggerisci uno start greedy (il primo slot libero)
+        oper_busy_until: dict[uuid.UUID, int] = {}
+
+        for op in sorted(self.operations, key=lambda o: o.earliest_start_minutes):
+            residual = self._compute_residual_duration(op)
+            qualified = self._get_qualified_operators(op)
+            if not qualified:
+                continue
+
+            chosen_oper = None
+            chosen_start = None
+
+            for oper in qualified:
+                busy = oper_busy_until.get(oper.id, 0)
+                candidate_start = max(op.earliest_start_minutes, busy)
+                
+                # Trova il primo slot disponibile
+                for slot_s, slot_e in oper.available_slots:
+                    if slot_e - slot_s < residual:
+                        continue
+                    actual_start = max(candidate_start, slot_s)
+                    if actual_start + residual <= slot_e:
+                        chosen_oper = oper
+                        chosen_start = actual_start
+                        break
+                if chosen_oper:
+                    break
+
+            if chosen_oper and chosen_start is not None:
+                self.model.AddHint(v.op_start[op.id], chosen_start)
+                self.model.AddHint(v.op_end[op.id], chosen_start + residual)
+                for oper in qualified:
+                    key = (op.id, oper.id)
+                    if key in v.assignments:
+                        self.model.AddHint(
+                            v.assignments[key], 
+                            1 if oper.id == chosen_oper.id else 0
+                        )
+                oper_busy_until[chosen_oper.id] = chosen_start + residual

@@ -378,6 +378,16 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
     for op_id, op_type, wc_id in orphan_ops[:10]:
         logger.info("  → %s tipo=%s wc=%s", op_id, op_type, wc_id)
 
+    impossible_ops = [
+        op for op in schedulable_ops 
+        if op.earliest_start_minutes + op.planned_duration_minutes > horizon
+    ]
+    logger.warning("Operazioni impossible (earliest+dur > horizon): %d", len(impossible_ops))
+
+    first_slots = [(str(q.id)[:8], q.available_slots[:2]) for q in qualified_operators[:3]]
+    logger.info("Primi slot operatori: %s", first_slots)
+    logger.info("Epoch: %s, Horizon: %d min (%s)", epoch, horizon, horizon_date)
+
     solution = builder.build_and_solve(
         objective_mode=objective_mode,
         params=params,
