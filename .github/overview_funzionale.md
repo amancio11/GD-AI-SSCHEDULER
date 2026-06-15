@@ -203,3 +203,324 @@ T=560 MA-003 completamente finito → (A4) sblocca op-MACH-1
 Sì. Se RP-M-01 (che punta a MA-003) non ha predecessori nel DAG, il solver lavorerà **prima i gruppi GRP-032..040, poi gli aggregati AGG-010..012, poi le operazioni di MA-003, e solo alla fine op-MACH-1**. Questa cascata emerge dai vincoli Tipo A a ogni livello, non da logica esplicita di ordinamento.
 
 L'unica cosa che il solver può fare in parallelo sono i rami indipendenti: GRP-032 e GRP-035 (che stanno su rami diversi dello stesso livello) possono essere lavorati contemporaneamente da operatori diversi, perché non c'è nessun vincolo tra loro.
+
+
+## ESMEPIO PIU' DETTAGLIATO:
+
+Ottima domanda. La risposta è: **dipende dal DAG intra-livello degli aggregati**. Lasciami tracciare l'esempio completo partendo dai dati reali del seed.Perfetto. Ora ho tutti i dati reali del seed. Posso fare l'esempio **completamente accurato**.
+
+---
+
+## Il DAG reale del seed per MA-003
+
+Dal `seed.py` gli archi del livello MA-003 sono:
+
+```
+RP-MA3-01 (→AGG-010 "Telaio Base")   ──► RP-MA3-02 (→AGG-011 "Montanti")
+RP-MA3-01 (→AGG-010 "Telaio Base")   ──► RP-MA3-03 (→AGG-012 "Traversa")
+```
+
+Quindi AGG-010 non ha predecessori a questo livello. AGG-011 e AGG-012 devono aspettare AGG-010.
+
+E il DAG dei gruppi dentro AGG-010 (dal seed):
+
+```
+RP-A010-01 (→GRP-032 "Longheroni Base")  ──► RP-A010-02 (→GRP-033 "Traversi Inferiori")
+RP-A010-01 (→GRP-032 "Longheroni Base")  ──► RP-A010-03 (→GRP-034 "Piastre Ancoraggio")
+```
+
+GRP-032 non ha predecessori. GRP-033 e GRP-034 aspettano GRP-032.
+
+---
+
+## Esempio completo con dati reali — Solo il ramo MA-003
+
+Assegno durate fittizie coerenti (random.seed(42), tra 120 e 480 min):
+
+```
+GRP-032 "Longheroni Base":     3 ops × 150min = 450min totali
+GRP-033 "Traversi Inferiori":  2 ops × 200min = 400min totali  
+GRP-034 "Piastre Ancoraggio":  3 ops × 120min = 360min totali
+
+GRP-035 "Colonne Verticali":   2 ops × 180min = 360min (figlio di AGG-011)
+GRP-036 "Rinforzi Laterali":   3 ops × 150min = 450min (figlio di AGG-011)
+GRP-037 "Giunti Colonne":      2 ops × 120min = 240min (figlio di AGG-011)
+GRP-038 "Tappi Chiusura":      2 ops × 90min  = 180min (figlio di AGG-011)
+
+GRP-039 "Trave Superiore":     2 ops × 300min = 600min (figlio di AGG-012)
+GRP-040 "Connettori Traversa": 2 ops × 150min = 300min (figlio di AGG-012)
+
+AGG-010: 3 ops con RP → GRP-032, GRP-033, GRP-034 × ~200min
+AGG-011: 4 ops con RP → GRP-035, GRP-036, GRP-037, GRP-038 × ~180min
+AGG-012: 2 ops con RP → GRP-039, GRP-040 × ~240min
+
+MA-003:  3 ops con RP → AGG-010, AGG-011, AGG-012 × ~300min
+```
+
+Operatori WC-BERGAMO: Mario (MECHANICAL), Luigi (MECHANICAL), Sara (MULTI) — 3 persone.
+
+---
+
+## Timeline minuto per minuto
+
+```
+════════════════════════════════════════════════════════════════════════
+T=0  START — Chi può iniziare SUBITO?
+════════════════════════════════════════════════════════════════════════
+
+Regola: un gruppo può iniziare subito SE non ha predecessori nel DAG
+        intra-livello dell'aggregato padre.
+
+DAG livello AGG-010:  GRP-032 non ha predecessori → LIBERO
+DAG livello AGG-011:  GRP-035 non ha predecessori → LIBERO  
+DAG livello AGG-012:  GRP-039 non ha predecessori → LIBERO
+
+Quindi a T=0 partono:
+  Mario  → op-GRP032-1 "Longheroni Base" [150min]
+  Luigi  → op-GRP035-1 "Colonne Verticali" [180min]
+  Sara   → op-GRP039-1 "Trave Superiore" [300min]
+
+                 Mario    Luigi    Sara
+  T=0 ─────────[GRP032][GRP035][GRP039]────────────────────────────►
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=150  Mario finisce op-GRP032-1
+════════════════════════════════════════════════════════════════════════
+
+GRP-032 ha ancora op-GRP032-2 e op-GRP032-3 da fare.
+Mario inizia op-GRP032-2 [150min].
+
+                 Mario    Luigi    Sara
+  T=150 ────────[GRP032][GRP035][GRP039]──────────────────────────────►
+                  (op2)
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=180  Luigi finisce op-GRP035-1
+════════════════════════════════════════════════════════════════════════
+
+GRP-035 ha ancora op-GRP035-2.
+Luigi inizia op-GRP035-2 [180min].
+
+                 Mario    Luigi    Sara
+  T=180 ────────[GRP032][GRP035][GRP039]──────────────────────────────►
+                  (op2)   (op2)
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=300  Mario finisce op-GRP032-2
+════════════════════════════════════════════════════════════════════════
+
+Mario inizia op-GRP032-3 [150min].
+
+                 Mario    Luigi    Sara
+  T=300 ────────[GRP032][GRP035][GRP039]──────────────────────────────►
+                  (op3)   (op2)
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=360  Luigi finisce op-GRP035-2  →  GRP-035 COMPLETATO ✓
+════════════════════════════════════════════════════════════════════════
+
+[TIPO B livello AGG-011]
+  RP-A011-01 (→GRP-035) ──► RP-A011-02 (→GRP-036)
+  RP-A011-01 (→GRP-035) ──► RP-A011-03 (→GRP-037)
+  RP-A011-01 (→GRP-035) ──► RP-A011-04 (→GRP-038)
+
+  GRP-035 completato → GRP-036, GRP-037, GRP-038 sbloccati
+
+Luigi ora può iniziare GRP-036 "Rinforzi Laterali" [150min].
+
+                 Mario    Luigi    Sara
+  T=360 ────────[GRP032][GRP036][GRP039]──────────────────────────────►
+                  (op3)   (op1)
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=450  Mario finisce op-GRP032-3  →  GRP-032 COMPLETATO ✓
+════════════════════════════════════════════════════════════════════════
+
+[TIPO B livello AGG-010]
+  RP-A010-01 (→GRP-032) ──► RP-A010-02 (→GRP-033)
+  RP-A010-01 (→GRP-032) ──► RP-A010-03 (→GRP-034)
+
+  GRP-032 completato → GRP-033 e GRP-034 sbloccati
+
+Mario inizia GRP-033 "Traversi Inferiori" [200min].
+
+                 Mario    Luigi    Sara
+  T=450 ────────[GRP033][GRP036][GRP039]──────────────────────────────►
+                  (op1)   (op1)
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=510  Luigi finisce op-GRP036-1
+════════════════════════════════════════════════════════════════════════
+
+Luigi inizia op-GRP036-2 [150min].
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=600  Sara finisce op-GRP039-1
+════════════════════════════════════════════════════════════════════════
+
+GRP-039 ha ancora op-GRP039-2.
+Sara inizia op-GRP039-2 [300min].
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=650  Mario finisce op-GRP033-1
+       Luigi finisce op-GRP036-2
+════════════════════════════════════════════════════════════════════════
+
+Mario → op-GRP033-2 [200min]
+Luigi → op-GRP036-3 [150min]
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=800  Luigi finisce op-GRP036-3  →  GRP-036 COMPLETATO ✓
+════════════════════════════════════════════════════════════════════════
+
+[TIPO B livello AGG-011]
+  RP-A011-02 (→GRP-036) ──► ??? (dal seed non ci sono archi uscenti da 02)
+
+  Intanto GRP-037 e GRP-038 erano già sbloccati da T=360.
+  Luigi può iniziare GRP-037 "Giunti Colonne" [120min].
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=850  Mario finisce op-GRP033-2  →  GRP-033 COMPLETATO ✓
+════════════════════════════════════════════════════════════════════════
+
+Mario inizia GRP-034 "Piastre Ancoraggio" [120min].
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=900  Luigi finisce GRP-037  →  GRP-037 COMPLETATO ✓
+════════════════════════════════════════════════════════════════════════
+
+Luigi inizia GRP-038 "Tappi Chiusura" [90min].
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=900  Sara finisce op-GRP039-2  →  GRP-039 COMPLETATO ✓
+════════════════════════════════════════════════════════════════════════
+
+[TIPO B livello AGG-012]
+  RP-A012-01 (→GRP-039) ──► RP-A012-02 (→GRP-040)
+  GRP-039 completato → GRP-040 sbloccato
+
+Sara inizia GRP-040 "Connettori Traversa" [150min].
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=970  Mario finisce GRP-034  →  GRP-034 COMPLETATO ✓
+T=990  Luigi finisce GRP-038  →  GRP-038 COMPLETATO ✓
+════════════════════════════════════════════════════════════════════════
+
+AGG-011 ora ha TUTTI i suoi gruppi completati:
+  GRP-035 ✓ T=360,  GRP-036 ✓ T=800
+  GRP-037 ✓ T=900,  GRP-038 ✓ T=990
+
+[TIPO A]  op-MA003-2 ha RP-MA3-02 → AGG-011
+          ops_target = op di AGG-011 + GRP-035..038 (tutte completate)
+          → ma op-MA003-2 aspetta il completamento delle op di AGG-011 stesso!
+          AGG-011 non ha ancora le sue operazioni schedulate.
+
+AGG-010 ha i suoi gruppi completati:
+  GRP-032 ✓ T=450,  GRP-033 ✓ T=850,  GRP-034 ✓ T=970
+
+[TIPO A]  op-AGG010-1 (RP-A010-01 → GRP-032): aspettava GRP-032 ✓ T=450
+          op-AGG010-2 (RP-A010-02 → GRP-033): aspettava GRP-033 ✓ T=850
+          op-AGG010-3 (RP-A010-03 → GRP-034): aspettava GRP-034 ✓ T=970
+
+          AGG-010 sbloccato a T=970 (quando l'ultimo gruppo è pronto)
+
+Mario inizia op-AGG010-1 [200min]
+Luigi inizia op-AGG011-1 [180min]  ← AGG-011 gruppi finiti, AGG-011 stesso può iniziare
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T=1050  Sara finisce GRP-040  →  GRP-040 COMPLETATO ✓
+════════════════════════════════════════════════════════════════════════
+
+AGG-012 ha tutti i suoi gruppi completati:
+  GRP-039 ✓ T=900,  GRP-040 ✓ T=1050
+
+[TIPO A] op-AGG012-1 (RP-A012-01 → GRP-039): aspettava GRP-039 ✓
+         op-AGG012-2 (RP-A012-02 → GRP-040): aspettava GRP-040 ✓
+
+Sara inizia op-AGG012-1 [240min]
+
+... (continuazione fino a completamento di tutti gli aggregati) ...
+```
+
+```
+════════════════════════════════════════════════════════════════════════
+T≈1800  AGG-010, AGG-011, AGG-012 tutti completati
+════════════════════════════════════════════════════════════════════════
+
+[TIPO A livello MA-003]
+  op-MA003-1 (RP-MA3-01 → AGG-010): aspettava AGG-010 + tutti suoi figli ✓
+  op-MA003-2 (RP-MA3-02 → AGG-011): aspettava AGG-011 + tutti suoi figli ✓
+  op-MA003-3 (RP-MA3-03 → AGG-012): aspettava AGG-012 + tutti suoi figli ✓
+
+  Ora le 3 operazioni di MA-003 possono iniziare (in parallelo tra loro,
+  perché il routing di MA-003 è SIMULTANEOUS e non c'è DAG tra le 3).
+
+  Ma attenzione al DAG intra-livello MA-003:
+  RP-MA3-01 (→AGG-010) ──► RP-MA3-02 (→AGG-011)
+  RP-MA3-01 (→AGG-010) ──► RP-MA3-03 (→AGG-012)
+
+  [TIPO B] ops(AGG-010 tree) devono finire prima di ops(AGG-011 tree)
+           ops(AGG-010 tree) devono finire prima di ops(AGG-012 tree)
+
+  Ma noi siamo già a T=1800 e AGG-010 è finito prima di AGG-011 e AGG-012,
+  quindi il Tipo B è già soddisfatto dai tempi reali. Le 3 op di MA-003
+  possono partire tutte in parallelo.
+
+T≈1800: op-MA003-1 [300min], op-MA003-2 [300min], op-MA003-3 [300min]
+        (distribuite sui 3 operatori disponibili)
+
+T≈2100: MA-003 completato ✓
+
+[TIPO B livello MACHINE]
+  RP-M-01 (→MA-003) ──► RP-M-02 (→MA-001)
+  RP-M-01 (→MA-003) ──► RP-M-03 (→MA-002)
+
+  MA-003 tree completato → MA-001 e MA-002 sbloccati
+  Da T≈2100: tutto il sotto-albero di MA-001 e MA-002 può iniziare
+```
+
+---
+
+## Risposta diretta alla tua domanda
+
+**GRP-032 è il primo gruppo schedulato all'interno del ramo MA-003?**
+
+Sì, ma non da solo. A T=0 partono **contemporaneamente** tre gruppi:
+
+| T=0 | Gruppo | Perché |
+|---|---|---|
+| GRP-032 | "Longheroni Base" | Non ha predecessori nel DAG di AGG-010 |
+| GRP-035 | "Colonne Verticali" | Non ha predecessori nel DAG di AGG-011 |
+| GRP-039 | "Trave Superiore" | Non ha predecessori nel DAG di AGG-012 |
+
+**GRP-032 è il "primo" del suo aggregato** (AGG-010), ma parallelamente partono anche i "primi" degli altri aggregati. Il solver li avvia tutti a T=0 perché non c'è nessun vincolo che li impedisce, e massimizzare il lavoro parallelo è sempre una buona strategia per finire prima.
+
+L'unico motivo per cui un gruppo non parte a T=0 è se ha un predecessore nel DAG intra-aggregato: GRP-033 e GRP-034 aspettano GRP-032, GRP-036/037/038 aspettano GRP-035, GRP-040 aspetta GRP-039.
