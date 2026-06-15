@@ -98,7 +98,7 @@ function useTaskPoller(taskId: string | null, onComplete: (result?: TaskResult) 
   const startPolling = (id: string) => {
     const interval = setInterval(async () => {
       try {
-        const { data } = await apiClient.get<TaskResult>(`/api/tasks/${id}`);
+        const { data } = await apiClient.get<TaskResult>(`/api/schedule/tasks/${id}`);
         if (data.status === 'SUCCESS' || data.status === 'FAILURE') {
           clearInterval(interval);
           setPollingId(null);

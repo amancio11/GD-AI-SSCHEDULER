@@ -111,7 +111,7 @@ def analyze_proactive(scenario_id: str) -> None:
 @celery_app.task(
     bind=True,
     name="app.core.scheduler.reschedule_engine.reschedule_incremental",
-    max_retries=3,
+    max_retries=1,           # ← al massimo 1 retry
     default_retry_delay=5,
 )
 def reschedule_incremental(self, scenario_id: str, triggered_by: str = "manual") -> dict:
@@ -146,7 +146,10 @@ def reschedule_incremental(self, scenario_id: str, triggered_by: str = "manual")
     except Exception as exc:
         session.rollback()
         logger.exception("reschedule_incremental FAILED scenario=%s", scenario_id)
-        raise self.retry(exc=exc)
+        # Retry solo per errori di connessione, non per bug logici
+        if "connection" in str(exc).lower() or "timeout" in str(exc).lower():
+            raise self.retry(exc=exc)
+        raise exc   # ← bug logici falliscono subito, senza loop
     finally:
         session.close()
 
@@ -587,12 +590,18 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
     logger.info("Epoch: %s, Horizon: %d min (%s)", epoch, horizon, horizon_date)
 
     solution = builder.build_and_solve(
-        objective_mode="FINISH_BY_DATE",
+        objective_mode=scenario.objective_mode or "FINISH_BY_DATE",
         params={},
         blocking_constraints={},        # non più usato per i RP (ora rp_order_constraints)
         rp_order_constraints=rp_order_constraints,   # ← NUOVO
         scenario_id=scenario_id,
         parent_wait_constraints=parent_wait_constraints,
+    )
+
+    makespan_days = (
+        round(solution.makespan_minutes / 1440, 2)
+        if solution.makespan_minutes is not None
+        else None
     )
 
     # Salva risultato nello scenario
@@ -625,11 +634,7 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
     # ── Step 9: Delete STALE entries ──────────────────────────────────────────
     _cleanup_stale(session, scenario_id)
 
-    makespan_days = (
-        round(solution.makespan_minutes / 1440, 2)
-        if solution.makespan_minutes is not None
-        else None
-    )
+
 
     return {
         "status": solution.status,

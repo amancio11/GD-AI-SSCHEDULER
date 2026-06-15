@@ -529,7 +529,7 @@ class CpsatModelBuilder:
         self.solver.parameters.num_search_workers = min(8, max(1, os.cpu_count() or 1))
         self.solver.parameters.log_search_progress = True
         self.solver.parameters.linearization_level = 1
-        self.solver.parameters.search_branching = 6  # PORTFOLIO_WITH_QUICK_RESTART
+        #self.solver.parameters.search_branching = 6  # PORTFOLIO_WITH_QUICK_RESTART
  
         # ── CRITICO: stop_after_first_solution SOLO se non c'è obiettivo ──
         # Se il solver ha un obiettivo (Minimize/Maximize), deve avere tempo

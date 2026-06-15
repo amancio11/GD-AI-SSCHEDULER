@@ -31,7 +31,7 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     task_track_started=True,
-    task_acks_late=True,            # acknowledge after completion (idempotency)
+    task_acks_late=False,   # ← acknowledge subito, evita re-queue su crash worker
     worker_prefetch_multiplier=1,   # one task at a time per worker
     task_max_retries=3,
     task_default_retry_delay=5,     # seconds between retries
