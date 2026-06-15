@@ -33,7 +33,7 @@ def upgrade() -> None:
         ("executionmode",         "'SIMULTANEOUS'"),
         ("operationtype",         "'ELECTRICAL','MECHANICAL','GENERAL'"),
         ("operationstatus",       "'PENDING','IN_PROGRESS','COMPLETED','BLOCKED','INTERRUPTED'"),
-        ("targetlevel",           "'MACROAGGREGATE','AGGREGATE'"),
+        ("targetlevel",           "'MACROAGGREGATE','AGGREGATE','GROUP'"),
         ("skilltype",             "'ELECTRICAL','MECHANICAL','MULTI'"),
         ("scheduleentrystatus",   "'SCHEDULED','IN_PROGRESS','COMPLETED','INTERRUPTED','DELAYED','STALE'"),
         ("objectivemode",         "'FINISH_BY_DATE','MAXIMIZE_RESOURCE_UTILIZATION','MINIMIZE_OPERATORS','CUSTOM'"),

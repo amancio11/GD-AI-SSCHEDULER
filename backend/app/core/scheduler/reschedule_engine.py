@@ -1,11 +1,34 @@
+from __future__ import annotations
+
 """Reschedule Engine — Celery tasks that orchestrate the full rescheduling pipeline.
 
 IMPORTANT: Celery workers do NOT support Python asyncio natively.
 All DB access here uses a *synchronous* SQLAlchemy engine (psycopg2 / pg8000).
 The async engine defined in app.db.session is used only by FastAPI request handlers.
-"""
-from __future__ import annotations
 
+PATCH reschedule_engine.py
+ 
+Sostituisce lo stub:
+    # ── Step 4d: Precedence pairs ─────────────────────────────────────────────
+    precedence_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
+    # (Operation-level pairs are derived from reference-point precedences — stub)
+ 
+Con l'implementazione reale che:
+1. Carica il DAG dei RP per il machine_model corrente
+2. Risolve ogni RP → production_order (via target_order_material)
+3. Per ogni arco RP_pred → RP_succ nel DAG:
+   - Raccoglie TUTTE le op_id dell'ordine puntato da RP_pred (ricorsivo sui figli)
+   - Raccoglie TUTTE le op_id dell'ordine puntato da RP_succ (ricorsivo)
+   - Aggiunge vincoli CP-SAT: per ogni (op_pred, op_succ): op_end[pred] <= op_start[succ]
+     tramite una variabile ausiliaria completion_X per efficienza
+ 
+NOTA: non usa blocking_constraints (dict statico), ma precedence_pairs esteso
+con la logica "tutti gli end di A <= tutti gli start di B".
+Questo funziona correttamente sia per il primo run (nessuna entry preesistente)
+sia per i run incrementali (alcune op COMPLETED con end fisso).
+"""
+
+from collections import defaultdict
 import logging
 import os
 import uuid
@@ -37,6 +60,42 @@ _SyncSession = sessionmaker(bind=_sync_engine, autocommit=False, autoflush=False
 def _get_sync_session() -> Session:
     return _SyncSession()
 
+# ════════════════════════════════════════════════════════════════════════
+# HELPER — raccolta ricorsiva di op_id da un ordine e tutti i suoi figli
+# ════════════════════════════════════════════════════════════════════════
+ 
+def _collect_ops_recursive(
+    order_id: uuid.UUID,
+    children_map: dict[uuid.UUID, list[uuid.UUID]],  # parent_id → [child_id, ...]
+    ops_by_order: dict[uuid.UUID, list[uuid.UUID]],   # order_id → [op_id, ...]
+    schedulable_op_ids: set[uuid.UUID],                # solo op schedulabili (non COMPLETED)
+) -> list[uuid.UUID]:
+    """Return all schedulable op_ids belonging to order_id and all its descendants.
+ 
+    Uses iterative DFS to avoid Python recursion limits on deep BOMs.
+    Stops descending into COMPONENT nodes (they have no ops anyway).
+    """
+    result: list[uuid.UUID] = []
+    stack = [order_id]
+    visited: set[uuid.UUID] = set()
+ 
+    while stack:
+        current = stack.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+ 
+        # Add ops of this order that are still schedulable
+        for op_id in ops_by_order.get(current, []):
+            if op_id in schedulable_op_ids:
+                result.append(op_id)
+ 
+        # Recurse into children
+        for child_id in children_map.get(current, []):
+            if child_id not in visited:
+                stack.append(child_id)
+ 
+    return result
 
 # ── Celery task stubs for AI (now delegates to proactive_analyzer) ───────────
 
@@ -114,6 +173,7 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
     from app.models.reference import ReferencePoint, ReferencePointPrecedence
     from app.models.routing import Operation, Routing
     from app.models.schedule import ScheduleEntry, ScheduleScenario
+    from app.models.machine import MachineModel, MachineOrder
 
     # ── Step 1: Load scenario ─────────────────────────────────────────────────
     scenario: ScheduleScenario | None = session.get(ScheduleScenario, scenario_id)
@@ -293,8 +353,120 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
             wc_str, count, len(opers_in_wc)
         )
 
-    # ── Step 4d: Precedence pairs ─────────────────────────────────────────────
-    precedence_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
+    # ── Step 4d: Precedence constraints dal DAG dei Reference Point ───────────
+    #
+    # Logica:
+    #   Per ogni arco RP_pred → RP_succ nel DAG:
+    #     - RP_pred.target_order_material → ordine A (+ tutti i suoi discendenti)
+    #     - RP_succ.target_order_material → ordine B (+ tutti i suoi discendenti)
+    #     - Tutte le op di A devono finire PRIMA che qualsiasi op di B inizi.
+    #
+    # Implementazione CP-SAT efficiente:
+    #   Invece di O(|A|×|B|) coppie, usiamo una variabile ausiliaria per gruppo:
+    #     completion_A = max(op_end[a] for a in ops_A)
+    #     for b in ops_B: model.Add(op_start[b] >= completion_A)
+    #   Questo viene fatto nel CpsatModelBuilder tramite rp_order_constraints.
+    #
+    # Qui nel reschedule_engine costruiamo il dict:
+    #   rp_order_constraints: list[tuple[list[op_id], list[op_id]]]
+    #   = [(ops_of_pred_order, ops_of_succ_order), ...]
+    # che viene passato al builder.
+ 
+    
+ 
+    # Carica machine_model_id dall\'ordine macchina
+    machine_order_row = session.get(MachineOrder, machine_order_id)  # già disponibile
+    # (se non già caricato: session.query(MachineOrder).filter_by(id=machine_order_id).first())
+    machine_model_id = machine_order_row.machine_model_id if machine_order_row else None
+ 
+    rp_order_constraints: list[tuple[list[uuid.UUID], list[uuid.UUID]]] = []
+    precedence_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []  # mantenuto vuoto (usiamo rp_order_constraints)
+ 
+    if machine_model_id is None:
+        logger.warning("machine_model_id non trovato per machine_order %s — skip RP precedences", machine_order_id)
+    else:
+        # Query 1: tutti i RP del modello
+        rp_rows = (
+            session.query(ReferencePoint)
+            .filter(ReferencePoint.machine_model_id == machine_model_id)
+            .all()
+        )
+        # material_code → production_order_id (per ordini di questa macchina)
+        all_pos = (
+            session.query(ProductionOrder.id, ProductionOrder.material_code)
+            .filter(ProductionOrder.machine_order_id == machine_order_id)
+            .all()
+        )
+        material_to_po_id: dict[str, uuid.UUID] = {
+            row.material_code: row.id for row in all_pos
+        }
+        rp_id_to_po_id: dict[uuid.UUID, uuid.UUID] = {}
+        for rp in rp_rows:
+            if rp.target_order_material and rp.target_order_material in material_to_po_id:
+                rp_id_to_po_id[rp.id] = material_to_po_id[rp.target_order_material]
+ 
+        # Query 2: tutti gli archi di precedenza del modello
+        prec_rows = (
+            session.query(ReferencePointPrecedence)
+            .filter(ReferencePointPrecedence.machine_model_id == machine_model_id)
+            .all()
+        )
+ 
+        # Costruisce children_map: parent_order_id → [child_order_id]
+        # Serve per la raccolta ricorsiva delle operazioni
+        children_map: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
+        for po_row in session.query(
+            ProductionOrder.id, ProductionOrder.parent_order_id
+        ).filter(ProductionOrder.machine_order_id == machine_order_id).all():
+            if po_row.parent_order_id:
+                children_map[po_row.parent_order_id].append(po_row.id)
+ 
+        # ops_by_order: order_id → [op_id] (solo op schedulabili)
+        schedulable_op_ids: set[uuid.UUID] = {op.id for op in schedulable_ops}
+        ops_by_order: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
+        for op_sc in schedulable_ops:
+            ops_by_order[op_sc.production_order_id].append(op_sc.id)
+ 
+        # Per ogni arco pred_rp → succ_rp nel DAG, costruisce il vincolo
+        for prec in prec_rows:
+            pred_rp_id = prec.predecessor_reference_point_id
+            succ_rp_id = prec.reference_point_id
+ 
+            pred_po_id = rp_id_to_po_id.get(pred_rp_id)
+            succ_po_id = rp_id_to_po_id.get(succ_rp_id)
+ 
+            if pred_po_id is None or succ_po_id is None:
+                logger.debug(
+                    "RP arco %s→%s: uno dei due ordini target non trovato — skip",
+                    pred_rp_id, succ_rp_id,
+                )
+                continue
+ 
+            # Raccoglie TUTTE le op schedulabili dell\'ordine A e dei suoi figli
+            ops_pred = _collect_ops_recursive(
+                pred_po_id, children_map, ops_by_order, schedulable_op_ids
+            )
+            ops_succ = _collect_ops_recursive(
+                succ_po_id, children_map, ops_by_order, schedulable_op_ids
+            )
+ 
+            if not ops_pred or not ops_succ:
+                logger.debug(
+                    "RP arco %s→%s: pred_ops=%d succ_ops=%d — nessun vincolo generato",
+                    pred_rp_id, succ_rp_id, len(ops_pred), len(ops_succ),
+                )
+                continue
+ 
+            rp_order_constraints.append((ops_pred, ops_succ))
+            logger.debug(
+                "RP constraint: %d op di ordine %s → %d op di ordine %s",
+                len(ops_pred), pred_po_id, len(ops_succ), succ_po_id,
+            )
+ 
+        logger.info(
+            "Step 4d: %d archi DAG → %d vincoli RP generati",
+            len(prec_rows), len(rp_order_constraints),
+        )
     # (Operation-level pairs are derived from reference-point precedences — stub)
 
     # ── Step 5-7: Horizon + CP-SAT ────────────────────────────────────────────
@@ -389,8 +561,10 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
     logger.info("Epoch: %s, Horizon: %d min (%s)", epoch, horizon, horizon_date)
 
     solution = builder.build_and_solve(
-        objective_mode=objective_mode,
-        params=params,
+        objective_mode="FINISH_BY_DATE",
+        params={},
+        blocking_constraints={},        # non più usato per i RP (ora rp_order_constraints)
+        rp_order_constraints=rp_order_constraints,   # ← NUOVO
         scenario_id=scenario_id,
     )
 

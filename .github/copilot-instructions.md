@@ -21,7 +21,7 @@ Concetti chiave del dominio:
 - I **componenti** sono tutti acquisto (o produzione non tracciata): non hanno routing,
   operazioni né BOM propria. Si verifica solo se sono mancanti o no.
 - Tutti gli ordini non-componente hanno un **routing** con N operazioni. Il routing è
-  SIMULTANEOUS: tutte le operazioni possono essere lavorate in parallelo da N risorse.
+  SIMULTANEOUS: tutte le operazioni possono essere lavorate in parallelo (solo una risorsa per ognuna).
 - Le **operazioni** possono essere interrotte e riprese. Mantengono `progress_pct`.
 - I **vincoli di precedenza** tra ordini sono espressi tramite **reference point**:
   ogni operazione dell'ordine macchina ha un reference point associato che identifica

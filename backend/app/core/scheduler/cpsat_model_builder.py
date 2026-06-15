@@ -55,6 +55,7 @@ class CpsatModelBuilder:
         self.epoch = epoch
         self.missing_constraints = missing_components_constraints
         self.precedence_pairs = precedence_pairs
+        self.rp_order_constraints: list[tuple[list[uuid.UUID], list[uuid.UUID]]] = []
 
         self.vars: CpsatVariables | None = None
         self._infeasibility_reasons: list[str] = []
@@ -184,7 +185,7 @@ class CpsatModelBuilder:
                 for (op_id, oper_id), bv in v.assignments.items():
                     if oper_id == oper.id:
                         model.Add(bv == 0)
-                        
+
     def _add_operator_nooverlap_constraints(self) -> None:
         """Each operator can work on at most one operation at a time."""
         assert self.vars is not None
@@ -229,6 +230,57 @@ class CpsatModelBuilder:
         for op_id, earliest_start in self.missing_constraints.items():
             if op_id in v.op_start:
                 model.Add(v.op_start[op_id] >= earliest_start)
+    
+    def _add_rp_order_constraints(self) -> None:
+        """Enforce ordering between operation groups via the Reference Point DAG.
+ 
+        For each (ops_pred, ops_succ) in self.rp_order_constraints:
+          - ops_pred: all schedulable op_ids of the predecessor RP's target order
+                      AND all its BOM descendants (populated in reschedule_engine)
+          - ops_succ: same for the successor RP's target order
+ 
+        One auxiliary IntVar `completion` = max(op_end[p] for p in ops_pred).
+        Every successor op must start >= completion.
+ 
+        Why not blocking_constraints (old approach):
+        - blocking_constraints needed pre-existing schedule_entries → empty on first run.
+        - rp_order_constraints works on CP-SAT variables → correct on every run.
+        """
+
+        assert self.vars is not None
+        v = self.vars
+        model = self.model
+ 
+        import logging
+        _log = logging.getLogger(__name__)
+ 
+        enforced = 0
+        skipped = 0
+ 
+        for idx, (ops_pred, ops_succ) in enumerate(self.rp_order_constraints):
+            # Filter to ops actually present in this model run
+            # (some may be COMPLETED and excluded from schedulable_ops)
+            active_pred = [op_id for op_id in ops_pred if op_id in v.op_end]
+            active_succ = [op_id for op_id in ops_succ if op_id in v.op_start]
+ 
+            if not active_pred or not active_succ:
+                skipped += 1
+                continue
+ 
+            # Auxiliary var: the moment all predecessor ops have finished
+            completion = model.NewIntVar(0, self.horizon, f"rp_completion_{idx}")
+            model.AddMaxEquality(completion, [v.op_end[op_id] for op_id in active_pred])
+ 
+            # Every successor op must wait for that moment
+            for succ_op_id in active_succ:
+                model.Add(v.op_start[succ_op_id] >= completion)
+ 
+            enforced += 1
+ 
+        _log.info(
+            "RP order constraints: %d enforced, %d skipped (no active ops on one side)",
+            enforced, skipped,
+        )
 
     def _set_objective(self, objective_mode: str, params: dict) -> None:
         """Configure the CP-SAT optimisation objective."""
@@ -359,6 +411,7 @@ class CpsatModelBuilder:
         params: dict,
         blocking_constraints: dict[uuid.UUID, int] | None = None,
         scenario_id: uuid.UUID | None = None,
+        rp_order_constraints: list[tuple[list[uuid.UUID], list[uuid.UUID]]] | None = None
     ) -> CpsatSolution:
     
         """Assemble the full model, run the solver, return CpsatSolution.
@@ -376,6 +429,7 @@ class CpsatModelBuilder:
         _log = logging.getLogger(__name__)
 
         self._blocking_constraints = blocking_constraints or {}
+        self.rp_order_constraints = rp_order_constraints or []
         self._infeasibility_reasons = []
 
         self.vars = self._create_variables()
@@ -390,7 +444,9 @@ class CpsatModelBuilder:
         self._add_operator_nooverlap_constraints()
         _log.info("Dopo operator_nooverlap: %d constraints", len(self.model.Proto().constraints))      
         self._add_precedence_constraints()
-        _log.info("Dopo precedence_constraints: %d constraints", len(self.model.Proto().constraints))   
+        _log.info("Dopo precedence_constraints: %d constraints", len(self.model.Proto().constraints))
+        self._add_rp_order_constraints()
+        _log.info("Dopo rp_order_constraints: %d constraints", len(self.model.Proto().constraints))
         self._add_missing_component_constraints()
         _log.info("Dopo precedence_constraints: %d constraints", len(self.model.Proto().constraints))  
         self._set_objective(objective_mode, params)
@@ -405,6 +461,7 @@ class CpsatModelBuilder:
         self.solver.parameters.linearization_level = 1     # più veloce per problemi reali
         self.solver.parameters.search_branching = 6        # PORTFOLIO_WITH_QUICK_RESTART
 
+        
         
         _log.info(
             "CP-SAT solving: %d ops, %d operators, horizon=%d min, timeout=%gs",

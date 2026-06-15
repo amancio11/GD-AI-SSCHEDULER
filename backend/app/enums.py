@@ -48,6 +48,7 @@ class OperationStatus(str, enum.Enum):
 class TargetLevel(str, enum.Enum):
     MACROAGGREGATE = "MACROAGGREGATE"
     AGGREGATE = "AGGREGATE"
+    GROUP = "GROUP"
 
 
 class SkillType(str, enum.Enum):
