@@ -467,6 +467,32 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
             "Step 4d: %d archi DAG → %d vincoli RP generati",
             len(prec_rows), len(rp_order_constraints),
         )
+
+        # ── Tipo A: ogni op con RP deve aspettare il completamento del target ────────
+        # parent_wait_constraints: list[tuple[list[op_id], op_id]]
+        # = [(ops_del_target_ricorsivo, op_id_del_padre), ...]
+        parent_wait_constraints: list[tuple[list[uuid.UUID], uuid.UUID]] = []
+
+        for op_sc in schedulable_ops:
+            if op_sc.reference_point_id is None:
+                continue
+            target_po_id = rp_id_to_po_id.get(op_sc.reference_point_id)
+            if target_po_id is None:
+                logger.debug("RP %s → nessun ordine target trovato per op %s", op_sc.reference_point_id, op_sc.id)
+                continue
+            ops_target = _collect_ops_recursive(
+                target_po_id, children_map, ops_by_order, schedulable_op_ids
+            )
+            if not ops_target:
+                logger.debug("RP target %s: nessuna op schedulabile — skip", target_po_id)
+                continue
+            parent_wait_constraints.append((ops_target, op_sc.id))
+            logger.debug(
+                "Parent-wait: op %s aspetta %d op del target %s",
+                op_sc.id, len(ops_target), target_po_id,
+            )
+
+        logger.info("Step 4d: %d parent_wait_constraints generati", len(parent_wait_constraints))
     # (Operation-level pairs are derived from reference-point precedences — stub)
 
     # ── Step 5-7: Horizon + CP-SAT ────────────────────────────────────────────
@@ -566,6 +592,7 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
         blocking_constraints={},        # non più usato per i RP (ora rp_order_constraints)
         rp_order_constraints=rp_order_constraints,   # ← NUOVO
         scenario_id=scenario_id,
+        parent_wait_constraints=parent_wait_constraints,
     )
 
     # ── Step 8: Persist new entries ───────────────────────────────────────────

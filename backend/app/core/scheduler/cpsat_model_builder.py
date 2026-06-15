@@ -56,6 +56,8 @@ class CpsatModelBuilder:
         self.missing_constraints = missing_components_constraints
         self.precedence_pairs = precedence_pairs
         self.rp_order_constraints: list[tuple[list[uuid.UUID], list[uuid.UUID]]] = []
+        self.parent_wait_constraints: list[tuple[list[uuid.UUID], uuid.UUID]] = []
+
 
         self.vars: CpsatVariables | None = None
         self._infeasibility_reasons: list[str] = []
@@ -282,6 +284,56 @@ class CpsatModelBuilder:
             enforced, skipped,
         )
 
+    def _add_parent_wait_constraints(self) -> None:
+        """Vincolo Tipo A: l'operazione del padre aspetta il completamento del figlio target.
+
+        Per ogni (ops_target, parent_op_id) in self.parent_wait_constraints:
+        - ops_target: tutte le op schedulabili dell'ordine puntato dal RP + figli BOM
+        - parent_op_id: l'op del livello padre che ha reference_point_id = quel RP
+
+        Semantica: start(parent_op) >= max(end(op) for op in ops_target)
+
+        Esempio concreto:
+        op-MACH-2 (RP-M-02 → MA-001) NON PUÒ INIZIARE
+        finché non finiscono TUTTE le op di MA-001 + AGG-001..005 + GRP-001..020
+        """
+        assert self.vars is not None
+        v = self.vars
+        model = self.model
+
+        import logging
+        _log = logging.getLogger(__name__)
+
+        enforced = 0
+        skipped = 0
+
+        for idx, (ops_target, parent_op_id) in enumerate(self.parent_wait_constraints):
+            # Solo le op effettivamente presenti nel modello (alcune potrebbero essere COMPLETED)
+            active_target = [op_id for op_id in ops_target if op_id in v.op_end]
+
+            if not active_target:
+                # Il target è già completamente finito (tutte COMPLETED) → nessun vincolo
+                skipped += 1
+                continue
+
+            if parent_op_id not in v.op_start:
+                skipped += 1
+                continue
+
+            # Variabile ausiliaria: il momento in cui finisce l'ULTIMA op del target
+            completion = model.NewIntVar(0, self.horizon, f"pw_completion_{idx}")
+            model.AddMaxEquality(completion, [v.op_end[op_id] for op_id in active_target])
+
+            # L'operazione padre non può iniziare prima di quel momento
+            model.Add(v.op_start[parent_op_id] >= completion)
+
+            enforced += 1
+
+        _log.info(
+            "Parent-wait constraints: %d enforced, %d skipped",
+            enforced, skipped,
+        )
+
     def _set_objective(self, objective_mode: str, params: dict) -> None:
         """Configure the CP-SAT optimisation objective."""
         assert self.vars is not None
@@ -411,7 +463,8 @@ class CpsatModelBuilder:
         params: dict,
         blocking_constraints: dict[uuid.UUID, int] | None = None,
         scenario_id: uuid.UUID | None = None,
-        rp_order_constraints: list[tuple[list[uuid.UUID], list[uuid.UUID]]] | None = None
+        rp_order_constraints: list[tuple[list[uuid.UUID], list[uuid.UUID]]] | None = None,
+        parent_wait_constraints: list[tuple[list[uuid.UUID], uuid.UUID]] | None = None,  # ← NUOVO
     ) -> CpsatSolution:
     
         """Assemble the full model, run the solver, return CpsatSolution.
@@ -430,6 +483,7 @@ class CpsatModelBuilder:
 
         self._blocking_constraints = blocking_constraints or {}
         self.rp_order_constraints = rp_order_constraints or []
+        self.parent_wait_constraints = parent_wait_constraints or [] 
         self._infeasibility_reasons = []
 
         self.vars = self._create_variables()
@@ -447,6 +501,8 @@ class CpsatModelBuilder:
         _log.info("Dopo precedence_constraints: %d constraints", len(self.model.Proto().constraints))
         self._add_rp_order_constraints()
         _log.info("Dopo rp_order_constraints: %d constraints", len(self.model.Proto().constraints))
+        self._add_parent_wait_constraints()
+        _log.info("Dopo parent_wait_constraints: %d constraints", len(self.model.Proto().constraints))
         self._add_missing_component_constraints()
         _log.info("Dopo precedence_constraints: %d constraints", len(self.model.Proto().constraints))  
         self._set_objective(objective_mode, params)
