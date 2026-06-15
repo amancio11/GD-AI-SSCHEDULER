@@ -132,4 +132,74 @@ Una volta calcolati i vincoli di precedenza, il builder aggiunge in ordine:
 6. **Parent wait constraints** (Tipo A): op padre aspetta completamento figlio ← **MANCANTE**
 7. **Missing components**: `start(op-GRP001-*) >= minuto 10080`
 
-Il solver trova una assegnazione che soddisfa tutti questi vincoli.
+
+## La cascata bottom-up
+
+Il solver CP-SAT non "sceglie" un ordine top-down. I vincoli lo **forzano** a lavorare bottom-up automaticamente.
+
+### Esempio concreto: RP-M-01 punta a MA-003 (nessun predecessore)
+
+```
+MACHINE
+  └── op-MACH-1  (reference_point_id = RP-M-01 → MA-003)
+
+MA-003 "Struttura Portante"
+  ├── op-MA003-1  (reference_point_id = RP-MA3-01 → AGG-010)
+  ├── op-MA003-2  (reference_point_id = RP-MA3-02 → AGG-011)
+  └── op-MA003-3  (reference_point_id = RP-MA3-03 → AGG-012)
+
+AGG-010 "Telaio Base"
+  ├── op-AGG010-1  (reference_point_id = RP-A010-01 → GRP-032)
+  └── op-AGG010-2  (reference_point_id = RP-A010-02 → GRP-033)
+
+GRP-032 "Longheroni Base"
+  ├── op-GRP032-1  (nessun RP)
+  ├── op-GRP032-2  (nessun RP)
+  └── op-GRP032-3  (nessun RP)
+```
+
+### I vincoli Tipo A che vengono generati
+
+```
+parent_wait_constraints contiene, tra gli altri:
+
+(A1) ops_target=[op-GRP032-*], parent_op=op-AGG010-1
+     → start(op-AGG010-1) >= max(end di tutte le op di GRP-032)
+
+(A2) ops_target=[op-GRP033-*], parent_op=op-AGG010-2
+     → start(op-AGG010-2) >= max(end di tutte le op di GRP-033)
+
+(A3) ops_target=[op-AGG010-*, op-GRP032-*, op-GRP033-*, ...], parent_op=op-MA003-1
+     → start(op-MA003-1) >= max(end di AGG-010 + tutti i suoi gruppi)
+
+(A4) ops_target=[tutte le op di MA-003 + AGG-010..012 + GRP-032..040], parent_op=op-MACH-1
+     → start(op-MACH-1) >= max(end di tutto il sotto-albero di MA-003)
+```
+
+### L'ordine che emerge automaticamente
+
+```
+T=0   GRP-032, GRP-033, GRP-034 iniziano subito (nessun vincolo li blocca)
+      GRP-035, GRP-036, GRP-037, GRP-038 iniziano subito (figli di AGG-011)
+      GRP-039, GRP-040 iniziano subito (figli di AGG-012)
+
+T=90  GRP-032 finito → (A1) sblocca op-AGG010-1
+      GRP-033 finito → (A2) sblocca op-AGG010-2
+
+T=200 AGG-010 finito → contribuisce a (A3) per op-MA003-1
+      AGG-011 finito → contribuisce al vincolo per op-MA003-2
+      AGG-012 finito → contribuisce al vincolo per op-MA003-3
+
+T=380 op-MA003-1, op-MA003-2, op-MA003-3 possono iniziare
+
+T=560 MA-003 completamente finito → (A4) sblocca op-MACH-1
+      E il Tipo B sblocca tutto il sotto-albero di MA-001 e MA-002
+```
+
+---
+
+## La risposta diretta alla tua domanda
+
+Sì. Se RP-M-01 (che punta a MA-003) non ha predecessori nel DAG, il solver lavorerà **prima i gruppi GRP-032..040, poi gli aggregati AGG-010..012, poi le operazioni di MA-003, e solo alla fine op-MACH-1**. Questa cascata emerge dai vincoli Tipo A a ogni livello, non da logica esplicita di ordinamento.
+
+L'unica cosa che il solver può fare in parallelo sono i rami indipendenti: GRP-032 e GRP-035 (che stanno su rami diversi dello stesso livello) possono essere lavorati contemporaneamente da operatori diversi, perché non c'è nessun vincolo tra loro.
