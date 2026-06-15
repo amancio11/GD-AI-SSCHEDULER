@@ -206,6 +206,7 @@ export interface ScheduleScenario {
   is_active: boolean;
   is_baseline: boolean;
   ai_explanation: string | null;
+  last_run_status?: 'OPTIMAL' | 'FEASIBLE' | 'INFEASIBLE' | null;
   created_at: ISODatetime;
 }
 

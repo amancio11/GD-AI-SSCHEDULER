@@ -82,17 +82,27 @@ const OBJECTIVE_META: Record<string, {
 
 // ── Hook polling task ─────────────────────────────────────────────────────────
 
-function useTaskPoller(taskId: string | null, onComplete: () => void) {
+interface TaskResult {
+  task_id: string;
+  status: string;
+  ready: boolean;
+  solver_status?: string;
+  makespan_days?: number;
+  operators_used?: number;
+  conflicts?: string[];
+}
+
+function useTaskPoller(taskId: string | null, onComplete: (result?: TaskResult) => void) {
   const [pollingId, setPollingId] = useState<ReturnType<typeof setInterval> | null>(null);
 
   const startPolling = (id: string) => {
     const interval = setInterval(async () => {
       try {
-        const { data } = await apiClient.get<{ status: string }>(`/api/tasks/${id}`);
+        const { data } = await apiClient.get<TaskResult>(`/api/tasks/${id}`);
         if (data.status === 'SUCCESS' || data.status === 'FAILURE') {
           clearInterval(interval);
           setPollingId(null);
-          onComplete();
+          onComplete(data);
         }
       } catch {
         clearInterval(interval);
@@ -158,8 +168,32 @@ function ScenarioCard({
             {meta?.icon}
             <span>{meta?.label || scenario.objective_mode}</span>
           </div>
+          {scenario.last_run_status && (
+            <span
+              className={`inline-flex px-2 py-1 rounded text-[10px] font-semibold ${
+                scenario.last_run_status === 'OPTIMAL'
+                  ? 'bg-green-900/30 text-green-400 border border-green-700/30'
+                  : scenario.last_run_status === 'FEASIBLE'
+                    ? 'bg-blue-900/30 text-blue-400 border border-blue-700/30'
+                    : scenario.last_run_status === 'INFEASIBLE'
+                      ? 'bg-red-900/30 text-red-400 border border-red-700/30'
+                      : 'bg-gray-900/30 text-gray-400 border border-gray-700/30'
+              }`}
+            >
+              {scenario.last_run_status === 'OPTIMAL' ? '✓ Ottimale'
+                : scenario.last_run_status === 'FEASIBLE' ? '~ Fattibile'
+                : scenario.last_run_status === 'INFEASIBLE' ? '✕ Non fattibile'
+                : scenario.last_run_status}
+            </span>
+          )}
+
+          {scenario.last_run_status === 'INFEASIBLE' && (
+            <p className="text-xs text-red-300 mt-2">
+              Vincoli incompatibili — modificare operatori, date o precedenze e riprovare
+            </p>
+          )}
         </div>
-        <div className="flex gap-1 ml-2 shrink-0">
+        <div className="flex gap-1 ml-2 shrink-0 flex-wrap justify-end">
           {scenario.is_active && (
             <span className="text-[10px] bg-green-900/50 text-green-300 rounded px-1.5 py-0.5 font-semibold flex items-center gap-1">
               <CheckCircle size={9} /> ATTIVO
@@ -167,6 +201,21 @@ function ScenarioCard({
           )}
           {(scenario as ScheduleScenario & { is_baseline?: boolean }).is_baseline && (
             <span className="text-[10px] bg-blue-900/50 text-blue-300 rounded px-1.5 py-0.5 font-semibold">BASELINE</span>
+          )}
+          {(scenario as ScheduleScenario & { last_run_status?: string }).last_run_status && (
+            <span className={`text-[10px] rounded px-1.5 py-0.5 font-semibold ${
+              (scenario as ScheduleScenario & { last_run_status?: string }).last_run_status === 'OPTIMAL'
+                ? 'bg-emerald-900/50 text-emerald-300'
+              : (scenario as ScheduleScenario & { last_run_status?: string }).last_run_status === 'FEASIBLE'
+                ? 'bg-cyan-900/50 text-cyan-300'
+              : (scenario as ScheduleScenario & { last_run_status?: string }).last_run_status === 'INFEASIBLE'
+                ? 'bg-red-900/50 text-red-300'
+              : 'bg-gray-900/50 text-gray-400'
+            }`}>
+              {(scenario as ScheduleScenario & { last_run_status?: string }).last_run_status === 'OPTIMAL' && '✓ Ottimale'}
+              {(scenario as ScheduleScenario & { last_run_status?: string }).last_run_status === 'FEASIBLE' && '~ Fattibile'}
+              {(scenario as ScheduleScenario & { last_run_status?: string }).last_run_status === 'INFEASIBLE' && '✕ Non fattibile'}
+            </span>
           )}
         </div>
       </div>
@@ -210,8 +259,13 @@ function ScenarioCard({
         >
           Baseline
         </button>
-        <button
-          onClick={(e) => { e.stopPropagation(); onDelete(); }}
+         <button
+          onClick={(e) => {
+            e.stopPropagation();
+            if (window.confirm(`Eliminare "${scenario.name}"?\nTutte le schedule entries verranno cancellate.`)) {
+              onDelete();
+            }
+          }}
           className="text-xs px-2 py-0.5 border border-destructive text-destructive rounded hover:bg-red-50 dark:hover:bg-red-950"
           title="Elimina scenario"
         >
@@ -522,6 +576,18 @@ function CompareSection({ scenarios }: { scenarios: ScheduleScenario[] }) {
             {scenarios.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
         </div>
+
+        {compareA && compareB && (
+          <div className="w-full text-xs text-amber-200">
+            {(!scA?.last_run_status || scA.last_run_status === 'INFEASIBLE') && (
+              <p>⚠ Scenario A non ha una schedulazione valida. Eseguire prima lo scheduling.</p>
+            )}
+            {(!scB?.last_run_status || scB.last_run_status === 'INFEASIBLE') && (
+              <p>⚠ Scenario B non ha una schedulazione valida. Eseguire prima lo scheduling.</p>
+            )}
+          </div>
+        )}
+        
         <button
           onClick={handleCompare}
           disabled={!compareA || !compareB || compareA === compareB || isComparing}
@@ -626,6 +692,8 @@ function CompareSection({ scenarios }: { scenarios: ScheduleScenario[] }) {
           </div>
         </div>
       )}
+
+
     </section>
   );
 }
@@ -647,10 +715,12 @@ export default function ScenarioManager() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [schedulingId, setSchedulingId] = useState<string | null>(null);
   const [schedulingTaskId, setSchedulingTaskId] = useState<string | null>(null);
+  const [lastRunResult, setLastRunResult] = useState<TaskResult | null>(null);
 
-  const { startPolling } = useTaskPoller(schedulingTaskId, () => {
+  const { startPolling } = useTaskPoller(schedulingTaskId, (result) => {
     setSchedulingId(null);
     setSchedulingTaskId(null);
+    if (result) setLastRunResult(result);
     qc.invalidateQueries({ queryKey: ['scenarios'] });
     qc.invalidateQueries({ queryKey: ['gantt'] });
   });
@@ -754,7 +824,112 @@ export default function ScenarioManager() {
               onDelete={() => deleteMutation.mutate(sc.id)}
               onSchedule={() => scheduleMutation.mutate(sc)}
             />
+            
           ))}
+          
+        </div>
+      )}
+      
+        
+      {/* Banner risultato scheduling */}
+      {lastRunResult && lastRunResult.solver_status === 'INFEASIBLE' && (
+        <div className="border border-red-600/40 bg-red-950/30 rounded-xl p-5">
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 text-red-400">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" />
+              </svg>
+            </div>
+            <div className="flex-1">
+              <h3 className="text-sm font-bold text-red-300">Soluzione non fattibile</h3>
+              <p className="text-xs text-red-400/80 mt-1 leading-relaxed">
+                Il solver CP-SAT non ha trovato una schedulazione valida con i vincoli attuali.
+                Cause possibili: troppi vincoli di precedenza, operatori insufficienti per il workcenter,
+                finestra temporale troppo stretta, o componenti mancanti che bloccano troppe operazioni.
+              </p>
+              {lastRunResult.conflicts && lastRunResult.conflicts.length > 0 && (
+                <div className="mt-3 space-y-1">
+                  <p className="text-xs font-medium text-red-300">Conflitti rilevati:</p>
+                  {lastRunResult.conflicts.map((c, i) => (
+                    <p key={i} className="text-xs text-red-400/70 pl-3 border-l-2 border-red-800">
+                      {c}
+                    </p>
+                  ))}
+                </div>
+              )}
+              <button
+                onClick={() => setLastRunResult(null)}
+                className="mt-3 text-xs text-red-400 underline hover:text-red-300"
+              >
+                Chiudi
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+ 
+      {lastRunResult && (lastRunResult.solver_status === 'OPTIMAL' || lastRunResult.solver_status === 'FEASIBLE') && (
+        <div className="border border-green-600/40 bg-green-950/20 rounded-xl p-4">
+          <div className="flex items-center gap-3">
+            <CheckCircle size={18} className="text-green-400" />
+            <div>
+              <p className="text-sm font-medium text-green-300">
+                Scheduling completato ({lastRunResult.solver_status === 'OPTIMAL' ? 'ottimale' : 'fattibile'})
+              </p>
+              <p className="text-xs text-green-400/70 mt-0.5">
+                {lastRunResult.makespan_days != null && `Durata: ${lastRunResult.makespan_days} giorni`}
+                {lastRunResult.operators_used != null && ` · ${lastRunResult.operators_used} operatori`}
+              </p>
+            </div>
+            <button
+              onClick={() => setLastRunResult(null)}
+              className="ml-auto text-xs text-green-400/60 hover:text-green-300"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Banner risultato ultimo scheduling */}
+      {lastRunResult?.solver_status === 'INFEASIBLE' && (
+        <div className="border border-red-600/40 bg-red-950/20 rounded-xl p-5">
+          <div className="flex items-start gap-3">
+            <span className="text-red-400 text-lg mt-0.5">✕</span>
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-red-300 mb-1">Soluzione non fattibile</p>
+              <p className="text-xs text-red-400/80 leading-relaxed">
+                Il solver CP-SAT non ha trovato una schedulazione valida con i vincoli attuali.
+                Possibili cause: operatori insufficienti nel workcenter, finestra temporale
+                troppo stretta, o componenti mancanti che bloccano troppe operazioni.
+              </p>
+              {lastRunResult.conflicts && lastRunResult.conflicts.length > 0 && (
+                <div className="mt-3 space-y-1">
+                  <p className="text-xs font-medium text-red-300">Dettagli conflitti:</p>
+                  {lastRunResult.conflicts.map((c, i) => (
+                    <p key={i} className="text-xs text-red-400/70 pl-3 border-l-2 border-red-800">{c}</p>
+                  ))}
+                </div>
+              )}
+            </div>
+            <button onClick={() => setLastRunResult(null)} className="text-red-400/60 hover:text-red-300 text-sm">✕</button>
+          </div>
+        </div>
+      )}
+
+      {lastRunResult?.solver_status && ['OPTIMAL', 'FEASIBLE'].includes(lastRunResult.solver_status) && (
+        <div className="border border-green-600/40 bg-green-950/10 rounded-xl p-4 flex items-center gap-3">
+          <CheckCircle size={18} className="text-green-400 shrink-0" />
+          <div className="flex-1">
+            <p className="text-sm font-medium text-green-300">
+              Scheduling {lastRunResult.solver_status === 'OPTIMAL' ? 'ottimale' : 'fattibile'} completato
+            </p>
+            <p className="text-xs text-green-400/70 mt-0.5">
+              {lastRunResult.makespan_days != null && `Durata: ${lastRunResult.makespan_days} giorni`}
+              {lastRunResult.operators_used != null && ` · ${lastRunResult.operators_used} operatori utilizzati`}
+            </p>
+          </div>
+          <button onClick={() => setLastRunResult(null)} className="text-green-400/60 hover:text-green-300 text-sm">✕</button>
         </div>
       )}
 

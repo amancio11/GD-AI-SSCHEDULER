@@ -5,7 +5,7 @@ import uuid
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, Float, String, Text
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -38,11 +38,11 @@ class ScheduleScenario(UUIDMixin, TimestampMixin, Base):
     is_baseline: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     ai_explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    last_run_status = Mapped[str] = mapped_column(String, nullable=True)       # "OPTIMAL" | "FEASIBLE" | "INFEASIBLE" | "ERROR"
-    last_run_at = Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_run_makespan_days = Mapped[float | None] = mapped_column(Float, nullable=True)
-    last_run_operators_used = Mapped[int | None] = mapped_column(Integer, nullable=True)
-    last_run_conflicts = Mapped[dict | None] = mapped_column(JSON, nullable=True)       # lista di conflitti se INFEASIBLE
+    last_run_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_run_makespan_days: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_run_operators_used: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_run_conflicts: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # Relationships
     machine_order: Mapped[MachineOrder] = relationship(
