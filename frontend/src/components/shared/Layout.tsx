@@ -18,6 +18,7 @@ import {
   Wifi,
   WifiOff,
   Database,
+  GitFork,
 } from 'lucide-react';
 import { useUiStore } from '../../store/uiStore';
 import { useAiStore } from '../../store/aiStore';
@@ -39,6 +40,7 @@ const NAV_ITEMS = [
   { to: '/ai',               label: 'AI Assistant',       icon: Bot },
   { to: '/export',           label: 'Export',             icon: Download },
   { to: '/db-admin',         label: 'DB Admin',           icon: Database },
+   { to: '/dag',             label: 'DAG Viewer',          icon: GitFork },
 ];
 
 function Breadcrumb() {

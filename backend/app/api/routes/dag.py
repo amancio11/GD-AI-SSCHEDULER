@@ -1,0 +1,258 @@
+"""Router: DAG completo con operazioni per visualizzazione frontend.
+
+Restituisce il grafo completo degli ordini di produzione con le loro operazioni,
+reference point e precedenze — arricchito di info per il React Flow viewer.
+
+Endpoint:
+  GET /api/dag/machine/{machine_order_id}/full
+    → DAGFullResponse con nodi (ordini+operazioni) e archi (precedenze RP + BOM)
+"""
+from __future__ import annotations
+
+import uuid
+import logging
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.session import get_db
+from app.models.production import ProductionOrder
+from app.models.machine import MachineOrder
+from app.models.routing import Routing, Operation
+from app.models.reference import ReferencePoint, ReferencePointPrecedence
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/dag", tags=["dag"])
+
+
+# ── Schemi risposta ───────────────────────────────────────────────────────────
+
+class DAGOperation(BaseModel):
+    id: str
+    sap_operation_id: str | None
+    description: str | None
+    operation_type: str
+    planned_duration_minutes: int
+    progress_pct: float
+    status: str
+    reference_point_id: str | None
+    reference_point_code: str | None  # es. "RP-MA1-01"
+    workcenter_id: str | None
+
+
+class DAGOrder(BaseModel):
+    id: str
+    sap_order_id: str
+    description: str | None
+    level: str                     # MACHINE | MACROAGGREGATE | AGGREGATE | GROUP | COMPONENT
+    material_code: str | None
+    progress_pct: float
+    status: str
+    parent_order_id: str | None
+    workcenter_id: str | None
+    operations: list[DAGOperation]
+
+
+class DAGEdge(BaseModel):
+    id: str
+    source: str                    # order_id del predecessore
+    target: str                    # order_id del successore
+    edge_type: str                 # "BOM_PARENT" | "RP_PRECEDENCE"
+    rp_predecessor_code: str | None
+    rp_successor_code: str | None
+    label: str | None
+
+
+class DAGFullResponse(BaseModel):
+    machine_order_id: str
+    machine_description: str | None
+    orders: list[DAGOrder]
+    edges: list[DAGEdge]
+    # Mappa rp_id → info RP per lookup rapido nel frontend
+    reference_points: dict[str, dict[str, Any]]
+
+
+# ── Endpoint ──────────────────────────────────────────────────────────────────
+
+@router.get("/machine/{machine_order_id}/full", response_model=DAGFullResponse)
+async def get_full_dag(
+    machine_order_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> DAGFullResponse:
+    """Restituisce il DAG completo con ordini, operazioni e archi di precedenza.
+
+    Struttura del grafo:
+    - Nodi: ogni ProductionOrder diventa un nodo contenente la lista delle sue operazioni
+    - Archi BOM_PARENT: figlio → padre (relazione gerarchia BOM)
+    - Archi RP_PRECEDENCE: target_RP_pred → target_RP_succ (vincoli del DAG RP)
+
+    Il frontend React Flow usa:
+    - Nodi a forma di card con lista operazioni interna
+    - Archi colorati per tipo (BOM=grigio, RP=arancione/rosso)
+    - Layout gerarchico automatico (top-down per livello BOM)
+    """
+    # 1. Carica machine_order
+    machine = await db.get(MachineOrder, machine_order_id)
+    if not machine:
+        raise HTTPException(status_code=404, detail="Machine order non trovato")
+
+    # 2. Carica tutti gli ordini di produzione di questa macchina
+    po_result = await db.execute(
+        select(ProductionOrder).where(
+            ProductionOrder.machine_order_id == machine_order_id
+        ).order_by(ProductionOrder.level, ProductionOrder.sap_order_id)
+    )
+    orders_db = list(po_result.scalars().all())
+
+    if not orders_db:
+        return DAGFullResponse(
+            machine_order_id=str(machine_order_id),
+            machine_description=machine.description,
+            orders=[],
+            edges=[],
+            reference_points={},
+        )
+
+    order_ids = [o.id for o in orders_db]
+
+    # 3. Carica tutti i routing per questi ordini (map: production_order_id → routing_id)
+    routing_result = await db.execute(
+        select(Routing).where(Routing.production_order_id.in_(order_ids))
+    )
+    routings_by_po: dict[uuid.UUID, uuid.UUID] = {
+        r.production_order_id: r.id for r in routing_result.scalars().all()
+    }
+
+    # 4. Carica tutte le operazioni per questi routing
+    routing_ids = list(routings_by_po.values())
+    ops_result = await db.execute(
+        select(Operation).where(Operation.routing_id.in_(routing_ids))
+        .order_by(Operation.sequence_number)
+    ) if routing_ids else None
+
+    ops_by_routing: dict[uuid.UUID, list[Operation]] = {}
+    if ops_result:
+        for op in ops_result.scalars().all():
+            ops_by_routing.setdefault(op.routing_id, []).append(op)
+
+    # 5. Carica reference points per questo machine_model
+    rp_result = await db.execute(
+        select(ReferencePoint).where(
+            ReferencePoint.machine_model_id == machine.machine_model_id
+        )
+    )
+    rps = {rp.id: rp for rp in rp_result.scalars().all()}
+
+    # 6. Carica precedenze RP
+    prec_result = await db.execute(
+        select(ReferencePointPrecedence).where(
+            ReferencePointPrecedence.machine_model_id == machine.machine_model_id
+        )
+    )
+    rp_precedences = list(prec_result.scalars().all())
+
+    # 7. Costruisci mappa material_code → order per risolvere i target RP
+    material_to_order: dict[str, ProductionOrder] = {
+        o.material_code: o for o in orders_db if o.material_code
+    }
+
+    # 8. Assembla nodi DAGOrder
+    dag_orders: list[DAGOrder] = []
+    for po in orders_db:
+        routing_id = routings_by_po.get(po.id)
+        operations_db = ops_by_routing.get(routing_id, []) if routing_id else []
+
+        dag_ops = []
+        for op in operations_db:
+            rp = rps.get(op.reference_point_id) if op.reference_point_id else None
+            dag_ops.append(DAGOperation(
+                id=str(op.id),
+                sap_operation_id=op.sap_operation_id,
+                description=op.description,
+                operation_type=op.operation_type.value if hasattr(op.operation_type, 'value') else str(op.operation_type),
+                planned_duration_minutes=op.planned_duration_minutes or 0,
+                progress_pct=op.progress_pct or 0.0,
+                status=op.status.value if hasattr(op.status, 'value') else str(op.status),
+                reference_point_id=str(op.reference_point_id) if op.reference_point_id else None,
+                reference_point_code=rp.code if rp else None,
+                workcenter_id=str(op.workcenter_id) if op.workcenter_id else None,
+            ))
+
+        dag_orders.append(DAGOrder(
+            id=str(po.id),
+            sap_order_id=po.sap_order_id,
+            description=po.description,
+            level=po.level.value if hasattr(po.level, 'value') else str(po.level),
+            material_code=po.material_code,
+            progress_pct=po.progress_pct or 0.0,
+            status=po.status.value if hasattr(po.status, 'value') else str(po.status),
+            parent_order_id=str(po.parent_order_id) if po.parent_order_id else None,
+            workcenter_id=str(po.workcenter_id) if po.workcenter_id else None,
+            operations=dag_ops,
+        ))
+
+    # 9. Costruisci archi
+    edges: list[DAGEdge] = []
+    edge_idx = 0
+
+    # Archi BOM: figlio → padre
+    order_map: dict[uuid.UUID, ProductionOrder] = {o.id: o for o in orders_db}
+    for po in orders_db:
+        if po.parent_order_id and po.parent_order_id in order_map:
+            edges.append(DAGEdge(
+                id=f"bom-{edge_idx}",
+                source=str(po.id),
+                target=str(po.parent_order_id),
+                edge_type="BOM_PARENT",
+                rp_predecessor_code=None,
+                rp_successor_code=None,
+                label="figlio di",
+            ))
+            edge_idx += 1
+
+    # Archi RP: target_pred_order → target_succ_order
+    for prec in rp_precedences:
+        pred_rp = rps.get(prec.predecessor_reference_point_id)
+        succ_rp = rps.get(prec.reference_point_id)
+        if not pred_rp or not succ_rp:
+            continue
+
+        pred_order = material_to_order.get(pred_rp.target_order_material or "")
+        succ_order = material_to_order.get(succ_rp.target_order_material or "")
+        if not pred_order or not succ_order:
+            continue
+
+        edges.append(DAGEdge(
+            id=f"rp-{edge_idx}",
+            source=str(pred_order.id),
+            target=str(succ_order.id),
+            edge_type="RP_PRECEDENCE",
+            rp_predecessor_code=pred_rp.code,
+            rp_successor_code=succ_rp.code,
+            label=f"{pred_rp.code} → {succ_rp.code}",
+        ))
+        edge_idx += 1
+
+    # 10. Mappa RP per il frontend
+    rp_info: dict[str, dict[str, Any]] = {
+        str(rp_id): {
+            "id": str(rp_id),
+            "code": rp.code,
+            "name": rp.name,
+            "target_level": rp.target_level.value if hasattr(rp.target_level, 'value') else str(rp.target_level),
+            "target_order_material": rp.target_order_material,
+        }
+        for rp_id, rp in rps.items()
+    }
+
+    return DAGFullResponse(
+        machine_order_id=str(machine_order_id),
+        machine_description=machine.description,
+        orders=dag_orders,
+        edges=edges,
+        reference_points=rp_info,
+    )

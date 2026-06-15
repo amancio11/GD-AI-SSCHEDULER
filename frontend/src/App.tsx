@@ -11,6 +11,7 @@ import MissingComponents from './pages/MissingComponents';
 import AIAssistant from './pages/AIAssistant';
 import ExportPage from './pages/ExportPage';
 import DBAdmin from './pages/DBAdmin';
+import DAGViewer from './pages/DAGViewer';
 
 export default function App() {
   return (
@@ -29,6 +30,7 @@ export default function App() {
           <Route path="/ai" element={<AIAssistant />} />
           <Route path="/export" element={<ExportPage />} />
           <Route path="/db-admin" element={<DBAdmin />} />
+          <Route path="/dag" element={<DAGViewer />} />
         </Route>
       </Routes>
     </BrowserRouter>

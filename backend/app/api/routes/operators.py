@@ -25,13 +25,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.models.operator import Operator, Shift, OperatorCalendar
 from app.schemas.operator import (
-    OperatorRead,
-    OperatorCreate,
-    OperatorUpdate,
-    ShiftRead,
-    OperatorCalendarRead,
-    OperatorCalendarCreate,
-    OperatorCalendarUpdate,
+OperatorRead, OperatorCreate, OperatorUpdate,
+OperatorCalendarRead, OperatorCalendarCreate, OperatorCalendarUpdate,
+CalendarBulkUpdateRequest, ShiftRead,
 )
 
 logger = logging.getLogger(__name__)
@@ -165,7 +161,7 @@ async def get_operator_calendar(
 async def upsert_operator_calendar(
     operator_id: uuid.UUID,
     cal_date: date,
-    payload: OperatorCalendarCreate,
+    payload: OperatorCalendarUpdate,   # FIX: non richiede operator_id/date nel body
     db: AsyncSession = Depends(get_db),
 ) -> OperatorCalendar:
     """Inserisce o aggiorna la disponibilità di un operatore per una specifica data.
@@ -197,12 +193,12 @@ async def upsert_operator_calendar(
     else:
         # Crea nuova riga
         entry = OperatorCalendar(
-            operator_id=operator_id,
-            date=cal_date,
-            shift_id=payload.shift_id,
-            is_available=payload.is_available,
-            notes=payload.notes,
-            override_reason=payload.override_reason,
+        operator_id=operator_id,
+        date=cal_date,
+        shift_id=payload.shift_id,
+        is_available=payload.is_available if payload.is_available is not None else True,
+        notes=payload.notes,
+        override_reason=payload.override_reason,
         )
         db.add(entry)
         await db.commit()

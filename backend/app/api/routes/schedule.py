@@ -15,7 +15,7 @@ from __future__ import annotations
 import uuid
 import logging
 from datetime import datetime, timezone
-
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +31,7 @@ from app.schemas.schedule import (
     ScheduleEntryRead,
     ScheduleEntryUpdate,
     GanttEntry,
+    ScenarioComparisonResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,6 +145,87 @@ async def update_scenario(
     await db.refresh(obj)
     return obj
 
+class ScenarioCompareRequest(BaseModel):
+    scenario_a_id: uuid.UUID
+    scenario_b_id: uuid.UUID
+
+
+@router.post("/compare", response_model=ScenarioComparisonResult)
+async def compare_scenarios_endpoint(
+    payload: ScenarioCompareRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ScenarioComparisonResult:
+    """Confronta due scenari: calcola delta KPI e restituisce i Gantt."""
+    sc_a = await db.get(ScheduleScenario, payload.scenario_a_id)
+    sc_b = await db.get(ScheduleScenario, payload.scenario_b_id)
+    if not sc_a:
+        raise HTTPException(status_code=404, detail=f"Scenario A non trovato: {payload.scenario_a_id}")
+    if not sc_b:
+        raise HTTPException(status_code=404, detail=f"Scenario B non trovato: {payload.scenario_b_id}")
+
+    async def _build_gantt(scenario_id: uuid.UUID) -> list[GanttEntry]:
+        entries_result = await db.execute(
+            select(ScheduleEntry)
+            .where(ScheduleEntry.scenario_id == scenario_id)
+            .order_by(ScheduleEntry.scheduled_start)
+        )
+        entries = list(entries_result.scalars().all())
+        if not entries:
+            return []
+        op_ids = [e.operation_id for e in entries]
+        op_result = await db.execute(select(Operation).where(Operation.id.in_(op_ids)))
+        ops_map = {op.id: op for op in op_result.scalars().all()}
+        operator_ids = list({e.operator_id for e in entries})
+        opr_result = await db.execute(select(Operator).where(Operator.id.in_(operator_ids)))
+        opr_map = {o.id: o for o in opr_result.scalars().all()}
+        op_color: dict[uuid.UUID, str] = {}
+        gantt: list[GanttEntry] = []
+        for entry in entries:
+            op = ops_map.get(entry.operation_id)
+            operator = opr_map.get(entry.operator_id)
+            if not op or not operator:
+                continue
+            if operator.id not in op_color:
+                op_color[operator.id] = GANTT_COLORS[len(op_color) % len(GANTT_COLORS)]
+            gantt.append(GanttEntry(
+                id=entry.id,
+                operation_id=op.id,
+                operation_desc=op.description,
+                order_id=op.routing_id,
+                order_desc=None,
+                operator_id=operator.id,
+                operator_name=operator.full_name,
+                workcenter_id=operator.workcenter_id,
+                start=entry.scheduled_start,
+                end=entry.scheduled_end,
+                status=entry.status,
+                color=op_color[operator.id],
+            ))
+        return gantt
+
+    gantt_a = await _build_gantt(payload.scenario_a_id)
+    gantt_b = await _build_gantt(payload.scenario_b_id)
+
+    def _makespan(gantt: list[GanttEntry]) -> float | None:
+        if not gantt:
+            return None
+        mn = min(e.start for e in gantt)
+        mx = max(e.end for e in gantt)
+        return round((mx - mn).total_seconds() / 86400, 2)
+
+    ms_a = _makespan(gantt_a)
+    ms_b = _makespan(gantt_b)
+    delta_ms = round(ms_b - ms_a, 2) if ms_a is not None and ms_b is not None else None
+    ops_a = len({e.operator_id for e in gantt_a})
+    ops_b = len({e.operator_id for e in gantt_b})
+
+    return ScenarioComparisonResult(
+        delta_makespan_days=delta_ms,
+        delta_operators=ops_b - ops_a,
+        delta_utilization=None,
+        gantt_a=gantt_a,
+        gantt_b=gantt_b,
+    )
 
 @router.delete("/{scenario_id}")
 async def delete_scenario(

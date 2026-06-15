@@ -1,185 +1,130 @@
-import { useState, useEffect } from 'react';
-import { useScenarios } from '../api/hooks/useSchedule';
+/**
+ * ScenarioManager.tsx — Gestione scenari di scheduling
+ *
+ * SCENARI — cos'è e perché esistono:
+ *
+ * Uno Scenario è un "piano alternativo" completo per la macchina.
+ * Permette di rispondere a domande come:
+ *   "Se puntassimo a finire entro il 30 luglio, quanti operatori ci vogliono?"
+ *   "Conviene minimizzare gli operatori o massimizzare l'utilizzo?"
+ *
+ * TIPI DI OBIETTIVO:
+ *   FINISH_BY_DATE             — CP-SAT minimizza il rischio di sforare la data target
+ *   MAXIMIZE_RESOURCE_UTILIZATION — massimizza il % di utilizzo degli operatori
+ *   MINIMIZE_OPERATORS         — usa il minor numero possibile di operatori distinti
+ *   CUSTOM                     — combinazione pesata dei 3 obiettivi sopra
+ *
+ * STATO DI UNO SCENARIO:
+ *   Senza run    → scenario vuoto, nessuna schedule_entry
+ *   Dopo run     → il solver CP-SAT ha assegnato ogni operazione a un operatore
+ *   ACTIVE       → il piano "ufficiale" della macchina (uno solo per macchina)
+ *   BASELINE     → riferimento di confronto (es. il piano originale approvato)
+ *
+ * CONFRONTO:
+ *   delta_makespan_days < 0 → lo Scenario B è più veloce (meglio per FINISH_BY_DATE)
+ *   delta_operators < 0     → lo Scenario B usa meno operatori
+ */
+
+import { useState } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import apiClient from '../api/client';
 import { useMachineStore } from '../store/machineStore';
 import { useScheduleStore } from '../store/scheduleStore';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
-import apiClient from '../api/client';
-import type { ObjectiveMode, ScheduleScenario, ScenarioComparisonResult } from '../api/types';
-import { Plus, X, TrendingUp, TrendingDown, Minus, Bot, Loader2, Play } from 'lucide-react';
+import type { ScheduleScenario } from '../api/types';
+import {
+  Play, Plus, Loader2, Info, ArrowUpDown, TrendingDown, TrendingUp, Minus,
+  CheckCircle, Target, Users, Calendar, Zap,
+} from 'lucide-react';
 
-// ── Polling hook for task status ──────────────────────────────────────────────
+// ── Tipi ─────────────────────────────────────────────────────────────────────
+
+interface ScenarioComparisonResult {
+  delta_makespan_days: number | null;
+  delta_operators: number | null;
+  delta_utilization: number | null;
+  gantt_a: unknown[];
+  gantt_b: unknown[];
+}
+
+// ── Costanti UI ───────────────────────────────────────────────────────────────
+
+const OBJECTIVE_META: Record<string, {
+  label: string;
+  description: string;
+  icon: React.ReactNode;
+  color: string;
+}> = {
+  FINISH_BY_DATE: {
+    label: 'Finisci entro data',
+    description: 'Il solver privilegia il completamento entro la data target. Utile quando c\'è una consegna ferma al cliente.',
+    icon: <Calendar size={14} />,
+    color: 'blue',
+  },
+  MAXIMIZE_RESOURCE_UTILIZATION: {
+    label: 'Massimizza utilizzo risorse',
+    description: 'Minimizza i tempi morti degli operatori. Utile per massimizzare la produttività dell\'impianto.',
+    icon: <Zap size={14} />,
+    color: 'green',
+  },
+  MINIMIZE_OPERATORS: {
+    label: 'Minimizza operatori',
+    description: 'Usa il minor numero possibile di operatori distinti. Utile per pianificare con risorse limitate.',
+    icon: <Users size={14} />,
+    color: 'purple',
+  },
+  CUSTOM: {
+    label: 'Personalizzato',
+    description: 'Combina i tre obiettivi con pesi personalizzati. Per pianificatori esperti.',
+    icon: <Target size={14} />,
+    color: 'orange',
+  },
+};
+
+// ── Hook polling task ─────────────────────────────────────────────────────────
 
 function useTaskPoller(taskId: string | null, onComplete: () => void) {
-  useEffect(() => {
-    if (!taskId) return;
+  const [pollingId, setPollingId] = useState<ReturnType<typeof setInterval> | null>(null);
+
+  const startPolling = (id: string) => {
     const interval = setInterval(async () => {
       try {
-        const { data } = await apiClient.get<{ status: string }>(`/api/schedule/task/${taskId}`);
+        const { data } = await apiClient.get<{ status: string }>(`/api/tasks/${id}`);
         if (data.status === 'SUCCESS' || data.status === 'FAILURE') {
           clearInterval(interval);
+          setPollingId(null);
           onComplete();
         }
       } catch {
         clearInterval(interval);
+        setPollingId(null);
+        onComplete();
       }
     }, 2000);
-    return () => clearInterval(interval);
-  }, [taskId, onComplete]);
+    setPollingId(interval);
+    return interval;
+  };
+
+  return { startPolling, isPolling: !!pollingId };
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Hooks dati ────────────────────────────────────────────────────────────────
 
-const OBJECTIVE_LABELS: Record<ObjectiveMode, string> = {
-  FINISH_BY_DATE:               'Finisci entro il',
-  MAXIMIZE_RESOURCE_UTILIZATION: 'Massimizza utilizzo risorse',
-  MINIMIZE_OPERATORS:           'Minimizza operatori',
-  CUSTOM:                       'Personalizzato',
-};
-
-function DeltaCell({ value, unit = '' }: { value: number | null | undefined; unit?: string }) {
-  if (value == null) return <td className="px-2 py-1 text-muted-foreground text-center">—</td>;
-  const isPos = value > 0;
-  const isNeg = value < 0;
-  return (
-    <td className={`px-2 py-1 text-center font-medium ${isPos ? 'text-red-600' : isNeg ? 'text-green-600' : ''}`}>
-      <span className="flex items-center justify-center gap-0.5">
-        {isPos ? <TrendingUp size={12} /> : isNeg ? <TrendingDown size={12} /> : <Minus size={12} />}
-        {Math.abs(value).toFixed(2)}{unit}
-      </span>
-    </td>
-  );
-}
-
-// ── New Scenario Modal ────────────────────────────────────────────────────────
-
-interface NewScenarioModalProps {
-  machineOrderId: string;
-  onClose: () => void;
-  onCreated: () => void;
-}
-
-function NewScenarioModal({ machineOrderId, onClose, onCreated }: NewScenarioModalProps) {
-  const [name, setName]           = useState('');
-  const [objective, setObjective] = useState<ObjectiveMode>('FINISH_BY_DATE');
-  const [targetDate, setTargetDate] = useState('');
-  const [taskId, setTaskId]       = useState<string | null>(null);
-  const [status, setStatus]       = useState<'idle' | 'creating' | 'scheduling' | 'done'>('idle');
-
-  useTaskPoller(taskId, () => {
-    setStatus('done');
-    onCreated();
-  });
-
-  const qc = useQueryClient();
-
-  const createMutation = useMutation({
-    mutationFn: async () => {
-      const { data: scenario } = await apiClient.post<ScheduleScenario>('/api/scenarios', {
-        name,
-        machine_order_id: machineOrderId,
-        objective_mode: objective,
-        target_finish_date: objective === 'FINISH_BY_DATE' ? targetDate || null : null,
-        resource_set_json: {},
-        is_active: false,
-        is_baseline: false,
-      });
-      setStatus('scheduling');
-      const { data: run } = await apiClient.post<{ task_id: string }>(`/api/scenarios/${scenario.id}/run`);
-      return run.task_id;
-    },
-    onSuccess: (tid) => {
-      qc.invalidateQueries({ queryKey: ['scenarios'] });
-      setTaskId(tid);
-      setStatus('scheduling');
+function useScenarios() {
+  return useQuery<ScheduleScenario[]>({
+    queryKey: ['scenarios'],
+    queryFn: async () => {
+      const { data } = await apiClient.get<ScheduleScenario[]>('/api/scenarios?page=1&size=50');
+      return data;
     },
   });
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="bg-card border border-border rounded-xl shadow-2xl p-6 w-[440px] text-sm">
-        <div className="flex justify-between items-center mb-4">
-          <h2 className="text-base font-semibold">Nuovo Scenario</h2>
-          <button onClick={onClose}><X size={16} /></button>
-        </div>
-
-        {status === 'done' ? (
-          <div className="text-center py-6">
-            <p className="text-green-600 font-semibold">✓ Scenario creato e schedulato!</p>
-            <button onClick={onClose} className="mt-4 px-4 py-1.5 bg-primary text-primary-foreground rounded text-sm">
-              Chiudi
-            </button>
-          </div>
-        ) : status === 'scheduling' ? (
-          <div className="flex flex-col items-center py-8 gap-3 text-muted-foreground">
-            <Loader2 className="animate-spin" size={28} />
-            <p className="text-sm">Schedulazione in corso…</p>
-          </div>
-        ) : (
-          <>
-            <div className="space-y-3">
-              <div>
-                <label className="block text-xs font-medium mb-1">Nome scenario</label>
-                <input
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="Es. Scenario Ottimizzato"
-                  className="w-full border border-border rounded px-2 py-1.5 bg-background"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-medium mb-1.5">Obiettivo</label>
-                <div className="space-y-1.5">
-                  {(['FINISH_BY_DATE', 'MAXIMIZE_RESOURCE_UTILIZATION', 'MINIMIZE_OPERATORS', 'CUSTOM'] as ObjectiveMode[]).map((obj) => (
-                    <label key={obj} className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="radio"
-                        name="objective"
-                        value={obj}
-                        checked={objective === obj}
-                        onChange={() => setObjective(obj)}
-                      />
-                      <span className="text-xs">{OBJECTIVE_LABELS[obj]}</span>
-                      {obj === 'FINISH_BY_DATE' && objective === 'FINISH_BY_DATE' && (
-                        <input
-                          type="date"
-                          value={targetDate}
-                          onChange={(e) => setTargetDate(e.target.value)}
-                          className="border border-border rounded px-1.5 py-0.5 text-xs bg-background ml-1"
-                        />
-                      )}
-                    </label>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            {createMutation.isError && (
-              <p className="text-xs text-destructive mt-2">Errore nella creazione.</p>
-            )}
-
-            <div className="flex gap-2 mt-5">
-              <button onClick={onClose} className="flex-1 py-1.5 border border-border rounded hover:bg-accent">
-                Annulla
-              </button>
-              <button
-                onClick={() => { setStatus('creating'); createMutation.mutate(); }}
-                disabled={!name.trim() || createMutation.isPending}
-                className="flex-1 py-1.5 bg-primary text-primary-foreground rounded hover:opacity-90 disabled:opacity-50"
-              >
-                Crea e Schedula
-              </button>
-            </div>
-          </>
-        )}
-      </div>
-    </div>
-  );
 }
 
-// ── Scenario Card ─────────────────────────────────────────────────────────────
+// ── Componente card scenario ──────────────────────────────────────────────────
 
-interface ScenarioCardProps {
+function ScenarioCard({
+  scenario, isSelected, isScheduling,
+  onSelect, onActivate, onBaseline, onDelete, onSchedule,
+}: {
   scenario: ScheduleScenario;
   isSelected: boolean;
   isScheduling: boolean;
@@ -188,71 +133,508 @@ interface ScenarioCardProps {
   onBaseline: () => void;
   onDelete: () => void;
   onSchedule: () => void;
-}
+}) {
+  const meta = OBJECTIVE_META[scenario.objective_mode];
+  const colorMap: Record<string, string> = {
+    blue: 'border-blue-600/60 bg-blue-900/10',
+    green: 'border-green-600/60 bg-green-900/10',
+    purple: 'border-purple-600/60 bg-purple-900/10',
+    orange: 'border-orange-600/60 bg-orange-900/10',
+  };
 
-function ScenarioCard({ scenario, isSelected, isScheduling, onSelect, onActivate, onBaseline, onDelete, onSchedule }: ScenarioCardProps) {
   return (
     <div
       onClick={onSelect}
-      className={`border rounded-xl p-4 cursor-pointer transition-all hover:shadow-md
-        ${isSelected ? 'border-primary ring-2 ring-primary/20' : 'border-border'}
+      className={`
+        border rounded-xl p-4 cursor-pointer transition-all
+        ${isSelected ? 'border-primary ring-2 ring-primary/20' : (meta ? colorMap[meta.color] : 'border-border')}
       `}
     >
       {/* Header */}
-      <div className="flex items-start justify-between mb-2">
-        <div>
-          <p className="font-semibold text-sm">{scenario.name}</p>
-          <p className="text-xs text-muted-foreground">
-            {OBJECTIVE_LABELS[scenario.objective_mode]} ·{' '}
-            {new Date(scenario.created_at).toLocaleDateString('it-IT')}
-          </p>
+      <div className="flex items-start justify-between mb-3">
+        <div className="flex-1 min-w-0">
+          <p className="font-semibold text-sm truncate">{scenario.name}</p>
+          <div className="flex items-center gap-1.5 mt-0.5 text-[10px] text-muted-foreground">
+            {meta?.icon}
+            <span>{meta?.label || scenario.objective_mode}</span>
+          </div>
         </div>
-        <div className="flex gap-1">
-          {scenario.is_active   && <span className="text-[10px] bg-green-100 text-green-700 rounded px-1.5">ACTIVE</span>}
-          {scenario.is_baseline && <span className="text-[10px] bg-blue-100 text-blue-700 rounded px-1.5">BASELINE</span>}
+        <div className="flex gap-1 ml-2 shrink-0">
+          {scenario.is_active && (
+            <span className="text-[10px] bg-green-900/50 text-green-300 rounded px-1.5 py-0.5 font-semibold flex items-center gap-1">
+              <CheckCircle size={9} /> ATTIVO
+            </span>
+          )}
+          {(scenario as ScheduleScenario & { is_baseline?: boolean }).is_baseline && (
+            <span className="text-[10px] bg-blue-900/50 text-blue-300 rounded px-1.5 py-0.5 font-semibold">BASELINE</span>
+          )}
         </div>
       </div>
 
-      {/* Schedula — azione primaria */}
+      {/* Descrizione obiettivo inline */}
+      {meta && (
+        <p className="text-[11px] text-muted-foreground mb-3 leading-relaxed">
+          {meta.description}
+        </p>
+      )}
+
+      <p className="text-[10px] text-muted-foreground mb-3">
+        Creato: {new Date(scenario.created_at).toLocaleDateString('it-IT', {
+          day: '2-digit', month: 'short', year: 'numeric',
+        })}
+      </p>
+
+      {/* Azione principale */}
       <button
         onClick={(e) => { e.stopPropagation(); onSchedule(); }}
         disabled={isScheduling}
-        className="w-full flex items-center justify-center gap-1.5 mt-3 py-1.5 bg-primary text-primary-foreground rounded text-xs font-medium hover:opacity-90 disabled:opacity-60"
+        className="w-full flex items-center justify-center gap-1.5 py-1.5 bg-primary text-primary-foreground rounded text-xs font-medium hover:opacity-90 disabled:opacity-60 mb-2"
       >
         {isScheduling ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
-        {isScheduling ? 'Scheduling in corso…' : 'Schedula'}
+        {isScheduling ? 'Scheduling in corso…' : 'Esegui Scheduling'}
       </button>
 
-      {/* Actions secondarie */}
-      <div className="flex gap-1.5 mt-2">
+      {/* Azioni secondarie */}
+      <div className="flex gap-1.5">
         <button
           onClick={(e) => { e.stopPropagation(); onActivate(); }}
-          className="text-xs px-2 py-0.5 border border-border rounded hover:bg-accent"
+          className="text-xs px-2 py-0.5 border border-border rounded hover:bg-accent flex-1"
+          title="Imposta come piano attivo"
         >
           Attiva
         </button>
         <button
           onClick={(e) => { e.stopPropagation(); onBaseline(); }}
-          className="text-xs px-2 py-0.5 border border-border rounded hover:bg-accent"
+          className="text-xs px-2 py-0.5 border border-border rounded hover:bg-accent flex-1"
+          title="Usa come baseline di riferimento"
         >
           Baseline
         </button>
         <button
           onClick={(e) => { e.stopPropagation(); onDelete(); }}
-          className="text-xs px-2 py-0.5 border border-destructive text-destructive rounded hover:bg-red-50 ml-auto"
+          className="text-xs px-2 py-0.5 border border-destructive text-destructive rounded hover:bg-red-50 dark:hover:bg-red-950"
+          title="Elimina scenario"
         >
-          Elimina
+          ✕
         </button>
       </div>
     </div>
   );
 }
 
-// ── Main page ─────────────────────────────────────────────────────────────────
+// ── Modal: Guida agli scenari ─────────────────────────────────────────────────
+
+function ScenarioGuideModal({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div
+        className="bg-background border border-border rounded-xl p-6 max-w-2xl w-full max-h-[80vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-5">
+          <h2 className="text-base font-bold">Guida agli Scenari di Scheduling</h2>
+          <button onClick={onClose} className="text-muted-foreground hover:text-foreground">✕</button>
+        </div>
+
+        <div className="space-y-5 text-sm">
+          <div>
+            <h3 className="font-semibold mb-2 text-primary">Cos'è uno Scenario?</h3>
+            <p className="text-muted-foreground leading-relaxed">
+              Uno scenario è un piano di scheduling completo e indipendente per la macchina.
+              Puoi creare più scenari con obiettivi diversi e confrontarli per scegliere il piano migliore
+              da rendere "attivo" (quello che diventa il piano ufficiale di produzione).
+            </p>
+          </div>
+
+          <div>
+            <h3 className="font-semibold mb-3">Tipi di Obiettivo</h3>
+            <div className="space-y-3">
+              {Object.entries(OBJECTIVE_META).map(([key, meta]) => (
+                <div key={key} className="flex gap-3 p-3 border border-border rounded-lg">
+                  <div className={`mt-0.5 text-${meta.color}-400`}>{meta.icon}</div>
+                  <div>
+                    <p className="font-medium text-sm">{meta.label}</p>
+                    <p className="text-muted-foreground text-xs mt-0.5 leading-relaxed">{meta.description}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <h3 className="font-semibold mb-2">Workflow tipico</h3>
+            <ol className="space-y-2 text-muted-foreground text-xs">
+              {[
+                'Crea 2-3 scenari con obiettivi diversi (es. "Finisci entro 30/8" e "Minimizza operatori")',
+                'Esegui lo scheduling su ciascuno — CP-SAT calcola il piano ottimale',
+                'Usa "Confronta" per vedere i delta di makespan e numero operatori',
+                'Attiva lo scenario migliore → diventa il piano ufficiale',
+                'Se cambiano i dati (nuovi ritardi, componenti mancanti) → ri-esegui lo scheduling',
+              ].map((step, i) => (
+                <li key={i} className="flex gap-2">
+                  <span className="text-primary font-bold">{i + 1}.</span>
+                  <span>{step}</span>
+                </li>
+              ))}
+            </ol>
+          </div>
+
+          <div className="border border-amber-600/30 bg-amber-900/20 rounded p-3">
+            <p className="text-amber-200 text-xs leading-relaxed">
+              <strong>Nota:</strong> Solo uno scenario può essere ATTIVO alla volta per macchina.
+              Il piano BASELINE è il riferimento di confronto (es. il piano originale approvato)
+              e non cambia anche quando si eseguono nuovi scheduling.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Modal: Nuovo Scenario ─────────────────────────────────────────────────────
+
+function NewScenarioModal({
+  machineOrderId,
+  onClose,
+}: {
+  machineOrderId: string;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [name, setName] = useState('');
+  const [objective, setObjective] = useState<string>('FINISH_BY_DATE');
+  const [targetDate, setTargetDate] = useState('');
+  const [state, setState] = useState<'idle' | 'creating' | 'scheduling' | 'done'>('idle');
+  const [taskId, setTaskId] = useState<string | null>(null);
+
+  const { startPolling } = useTaskPoller(taskId, () => {
+    setState('done');
+    qc.invalidateQueries({ queryKey: ['scenarios'] });
+    setTimeout(onClose, 1500);
+  });
+
+  async function handleCreate() {
+    if (!name.trim()) return;
+    setState('creating');
+    try {
+      const { data: scenario } = await apiClient.post<ScheduleScenario>('/api/scenarios', {
+        name: name.trim(),
+        machine_order_id: machineOrderId,
+        objective_mode: objective,
+        target_finish_date: objective === 'FINISH_BY_DATE' && targetDate ? targetDate : null,
+        is_active: false,
+        is_baseline: false,
+      });
+      setState('scheduling');
+      const { data: run } = await apiClient.post<{ task_id: string }>(`/api/scenarios/${scenario.id}/run`);
+      setTaskId(run.task_id);
+      startPolling(run.task_id);
+    } catch {
+      setState('idle');
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div
+        className="bg-background border border-border rounded-xl p-6 max-w-lg w-full"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-5">
+          <h2 className="text-base font-bold">Nuovo Scenario</h2>
+          <button onClick={onClose} className="text-muted-foreground hover:text-foreground">✕</button>
+        </div>
+
+        {state === 'done' ? (
+          <div className="flex flex-col items-center py-8 gap-3 text-green-400">
+            <CheckCircle size={40} />
+            <p className="font-semibold">Scenario creato e schedulato!</p>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-xs font-medium mb-1">Nome scenario</label>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="es. Piano consegna 30 agosto"
+                className="w-full px-3 py-2 text-sm border border-border rounded bg-background focus:outline-none focus:ring-1 focus:ring-primary"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium mb-2">Obiettivo di scheduling</label>
+              <div className="space-y-2">
+                {Object.entries(OBJECTIVE_META).map(([key, meta]) => (
+                  <label
+                    key={key}
+                    className={`flex items-start gap-3 p-3 border rounded-lg cursor-pointer transition-colors ${
+                      objective === key ? 'border-primary bg-primary/5' : 'border-border hover:bg-accent/30'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="objective"
+                      value={key}
+                      checked={objective === key}
+                      onChange={() => setObjective(key)}
+                      className="mt-0.5"
+                    />
+                    <div>
+                      <div className="flex items-center gap-1.5 font-medium text-sm">
+                        <span className="text-muted-foreground">{meta.icon}</span>
+                        {meta.label}
+                      </div>
+                      <p className="text-xs text-muted-foreground mt-0.5">{meta.description}</p>
+                    </div>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {objective === 'FINISH_BY_DATE' && (
+              <div>
+                <label className="block text-xs font-medium mb-1">Data target di completamento</label>
+                <input
+                  type="date"
+                  value={targetDate}
+                  onChange={(e) => setTargetDate(e.target.value)}
+                  className="w-full px-3 py-2 text-sm border border-border rounded bg-background focus:outline-none focus:ring-1 focus:ring-primary"
+                />
+              </div>
+            )}
+
+            <button
+              onClick={handleCreate}
+              disabled={!name.trim() || state !== 'idle'}
+              className="w-full flex items-center justify-center gap-2 py-2 bg-primary text-primary-foreground rounded font-medium text-sm hover:opacity-90 disabled:opacity-50"
+            >
+              {state === 'creating' && <Loader2 size={14} className="animate-spin" />}
+              {state === 'scheduling' && <Loader2 size={14} className="animate-spin" />}
+              {state === 'idle' && <Plus size={14} />}
+              {state === 'idle' ? 'Crea e Schedula' : state === 'creating' ? 'Creazione…' : 'Scheduling…'}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Sezione confronto scenari ─────────────────────────────────────────────────
+
+function DeltaCell({ value, unit = '', lowerIsBetter = true }: {
+  value: number | null; unit?: string; lowerIsBetter?: boolean;
+}) {
+  if (value === null || value === undefined) {
+    return <span className="text-muted-foreground">—</span>;
+  }
+  const isBetter = lowerIsBetter ? value < 0 : value > 0;
+  const isNeutral = value === 0;
+  return (
+    <span className={`flex items-center gap-1 font-semibold text-sm ${
+      isNeutral ? 'text-muted-foreground' :
+      isBetter ? 'text-green-400' : 'text-red-400'
+    }`}>
+      {isNeutral ? <Minus size={12} /> : isBetter ? <TrendingDown size={12} /> : <TrendingUp size={12} />}
+      {value > 0 ? '+' : ''}{value.toFixed(1)}{unit}
+    </span>
+  );
+}
+
+function CompareSection({ scenarios }: { scenarios: ScheduleScenario[] }) {
+  const [compareA, setCompareA] = useState('');
+  const [compareB, setCompareB] = useState('');
+  const [result, setResult] = useState<ScenarioComparisonResult | null>(null);
+  const [aiText, setAiText] = useState<string | null>(null);
+  const [isComparing, setIsComparing] = useState(false);
+  const [isAiLoading, setIsAiLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleCompare() {
+    if (!compareA || !compareB || compareA === compareB) return;
+    setIsComparing(true);
+    setError(null);
+    setResult(null);
+    setAiText(null);
+    try {
+      const { data } = await apiClient.post<ScenarioComparisonResult>('/api/scenarios/compare', {
+        scenario_a_id: compareA,
+        scenario_b_id: compareB,
+      });
+      setResult(data);
+    } catch (e: unknown) {
+      const err = e as { response?: { data?: { detail?: string } }; message?: string };
+      setError(err.response?.data?.detail || err.message || 'Errore nel confronto');
+    } finally {
+      setIsComparing(false);
+    }
+  }
+
+  async function handleAICompare() {
+    if (!compareA || !compareB) return;
+    setIsAiLoading(true);
+    try {
+      const { data } = await apiClient.post<{ recommendation: string }>('/api/ai/compare-scenarios', {
+        scenario_a_id: compareA,
+        scenario_b_id: compareB,
+        machine_order_id: scenarios.find((s) => s.id === compareA)?.machine_order_id,
+      });
+      setAiText(data.recommendation);
+    } catch {
+      setAiText('Errore nell\'analisi AI. Verificare che il servizio AI sia disponibile.');
+    } finally {
+      setIsAiLoading(false);
+    }
+  }
+
+  const scA = scenarios.find((s) => s.id === compareA);
+  const scB = scenarios.find((s) => s.id === compareB);
+
+  return (
+    <section className="border border-border rounded-xl p-5">
+      <div className="flex items-center gap-2 mb-4">
+        <ArrowUpDown size={16} className="text-primary" />
+        <h2 className="text-sm font-bold">Confronto Scenari</h2>
+      </div>
+
+      <div className="flex flex-wrap gap-3 items-end mb-4">
+        <div>
+          <label className="block text-xs text-muted-foreground mb-1">Scenario A (riferimento)</label>
+          <select
+            value={compareA}
+            onChange={(e) => setCompareA(e.target.value)}
+            className="border border-border rounded px-2 py-1.5 text-sm bg-background min-w-[200px]"
+          >
+            <option value="">Seleziona scenario A…</option>
+            {scenarios.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="block text-xs text-muted-foreground mb-1">Scenario B (da confrontare)</label>
+          <select
+            value={compareB}
+            onChange={(e) => setCompareB(e.target.value)}
+            className="border border-border rounded px-2 py-1.5 text-sm bg-background min-w-[200px]"
+          >
+            <option value="">Seleziona scenario B…</option>
+            {scenarios.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </div>
+        <button
+          onClick={handleCompare}
+          disabled={!compareA || !compareB || compareA === compareB || isComparing}
+          className="px-4 py-1.5 bg-primary text-primary-foreground rounded text-sm font-medium disabled:opacity-50 flex items-center gap-1.5"
+        >
+          {isComparing && <Loader2 size={12} className="animate-spin" />}
+          {isComparing ? 'Confronto…' : 'Confronta'}
+        </button>
+      </div>
+
+      {error && (
+        <div className="border border-red-600/30 bg-red-900/20 rounded p-3 text-red-300 text-sm mb-4">
+          ⚠ {error}
+          <p className="text-xs mt-1 text-red-400">
+            Assicurati che entrambi gli scenari abbiano eseguito lo scheduling (abbiano schedule entries).
+          </p>
+        </div>
+      )}
+
+      {result && (
+        <div className="space-y-4">
+          {/* Delta KPI */}
+          <div className="grid grid-cols-3 gap-3">
+            {[
+              { label: 'Δ Durata (giorni)', value: result.delta_makespan_days, unit: 'gg', lowerIsBetter: true,
+                tooltip: 'Negativo = B è più veloce (meglio). Positivo = B è più lento.' },
+              { label: 'Δ Operatori', value: result.delta_operators, unit: '', lowerIsBetter: true,
+                tooltip: 'Negativo = B usa meno operatori (meglio per MINIMIZE_OPERATORS).' },
+              { label: 'Δ Utilizzo %', value: result.delta_utilization, unit: '%', lowerIsBetter: false,
+                tooltip: 'Positivo = B ha operatori più occupati (meglio per MAXIMIZE_UTILIZATION).' },
+            ].map((kpi) => (
+              <div key={kpi.label} className="border border-border rounded-lg p-3" title={kpi.tooltip}>
+                <div className="text-xs text-muted-foreground mb-1">{kpi.label}</div>
+                <DeltaCell value={kpi.value} unit={kpi.unit} lowerIsBetter={kpi.lowerIsBetter} />
+              </div>
+            ))}
+          </div>
+
+          {/* Tabella comparativa */}
+          <table className="w-full text-xs border border-border rounded overflow-hidden">
+            <thead className="bg-muted">
+              <tr>
+                <th className="text-left py-2 px-3 font-medium">Metrica</th>
+                <th className="text-left py-2 px-3 font-medium">{scA?.name || 'A'}</th>
+                <th className="text-left py-2 px-3 font-medium">{scB?.name || 'B'}</th>
+                <th className="text-left py-2 px-3 font-medium">Delta (B-A)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr className="border-t border-border">
+                <td className="py-2 px-3 text-muted-foreground">Operazioni schedulate</td>
+                <td className="py-2 px-3 font-semibold">{result.gantt_a.length}</td>
+                <td className="py-2 px-3 font-semibold">{result.gantt_b.length}</td>
+                <td className="py-2 px-3">
+                  <DeltaCell value={result.gantt_b.length - result.gantt_a.length} lowerIsBetter={false} />
+                </td>
+              </tr>
+              <tr className="border-t border-border">
+                <td className="py-2 px-3 text-muted-foreground">Makespan (giorni)</td>
+                <td className="py-2 px-3 font-semibold">
+                  {result.delta_makespan_days !== null
+                    ? '—'
+                    : '—'}
+                </td>
+                <td className="py-2 px-3 font-semibold">—</td>
+                <td className="py-2 px-3">
+                  <DeltaCell value={result.delta_makespan_days} unit="gg" lowerIsBetter={true} />
+                </td>
+              </tr>
+              <tr className="border-t border-border">
+                <td className="py-2 px-3 text-muted-foreground">Operatori usati</td>
+                <td className="py-2 px-3 font-semibold">—</td>
+                <td className="py-2 px-3 font-semibold">—</td>
+                <td className="py-2 px-3">
+                  <DeltaCell value={result.delta_operators} lowerIsBetter={true} />
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          {/* AI Analysis */}
+          <div className="border border-border rounded-lg p-3">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-semibold">Analisi AI (opzionale)</span>
+              <button
+                onClick={handleAICompare}
+                disabled={isAiLoading}
+                className="text-xs px-3 py-1 bg-violet-900/40 text-violet-300 border border-violet-700/40 rounded hover:bg-violet-900/60 disabled:opacity-50 flex items-center gap-1.5"
+              >
+                {isAiLoading && <Loader2 size={10} className="animate-spin" />}
+                {isAiLoading ? 'Analisi…' : '✨ Analizza differenze con AI'}
+              </button>
+            </div>
+            {aiText && (
+              <p className="text-xs text-muted-foreground leading-relaxed">{aiText}</p>
+            )}
+            {!aiText && !isAiLoading && (
+              <p className="text-xs text-muted-foreground italic">
+                Clicca il pulsante per ottenere una raccomandazione AI su quale scenario scegliere.
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ── Pagina principale ─────────────────────────────────────────────────────────
 
 export default function ScenarioManager() {
   const { selectedMachineOrderId } = useMachineStore();
-  const { setActiveScenarioId }    = useScheduleStore();
+  const { setActiveScenarioId } = useScheduleStore();
   const qc = useQueryClient();
 
   const { data: scenarios = [], isLoading } = useScenarios();
@@ -260,13 +642,13 @@ export default function ScenarioManager() {
     (s) => !selectedMachineOrderId || s.machine_order_id === selectedMachineOrderId
   );
 
-  const [showCreateModal, setShowCreateModal] = useState(false);
-  const [selectedId, setSelectedId]           = useState<string | null>(null);
-  const [schedulingId, setSchedulingId]       = useState<string | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [showGuide, setShowGuide] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [schedulingId, setSchedulingId] = useState<string | null>(null);
   const [schedulingTaskId, setSchedulingTaskId] = useState<string | null>(null);
 
-  // Polling per lo scheduling avviato da card esistente
-  useTaskPoller(schedulingTaskId, () => {
+  const { startPolling } = useTaskPoller(schedulingTaskId, () => {
     setSchedulingId(null);
     setSchedulingTaskId(null);
     qc.invalidateQueries({ queryKey: ['scenarios'] });
@@ -279,22 +661,10 @@ export default function ScenarioManager() {
       return data.task_id;
     },
     onMutate: (scenario) => setSchedulingId(scenario.id),
-    onSuccess: (taskId) => setSchedulingTaskId(taskId),
+    onSuccess: (taskId) => { setSchedulingTaskId(taskId); startPolling(taskId); },
     onError: () => setSchedulingId(null),
   });
 
-  // Comparison
-  const [compareA, setCompareA] = useState<string>('');
-  const [compareB, setCompareB] = useState<string>('');
-  const [compResult, setCompResult] = useState<ScenarioComparisonResult | null>(null);
-  const [aiCompare, setAiCompare]   = useState<string | null>(null);
-
-  // What-if
-  const [whatIfText, setWhatIfText]     = useState('');
-  const [whatIfResult, setWhatIfResult] = useState<string | null>(null);
-  const [whatIfLoading, setWhatIfLoading] = useState(false);
-
-  // Mutations
   const activateMutation = useMutation({
     mutationFn: (id: string) => apiClient.patch(`/api/scenarios/${id}`, { is_active: true }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['scenarios'] }),
@@ -310,46 +680,6 @@ export default function ScenarioManager() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['scenarios'] }),
   });
 
-  const compareMutation = useMutation({
-    mutationFn: () =>
-      apiClient.post<ScenarioComparisonResult>('/api/scenarios/compare', {
-        scenario_a_id: compareA,
-        scenario_b_id: compareB,
-      }),
-    onSuccess: (res) => setCompResult(res.data),
-  });
-
-  const aiCompareMutation = useMutation({
-    mutationFn: () =>
-      apiClient.post<{ recommendation: string }>('/api/ai/compare-scenarios', {
-        scenario_a_id: compareA,
-        scenario_b_id: compareB,
-      }),
-    onSuccess: (res) => setAiCompare(res.data.recommendation ?? JSON.stringify(res.data)),
-  });
-
-  async function handleWhatIf() {
-    if (!whatIfText.trim() || !selectedId) return;
-    setWhatIfLoading(true);
-    try {
-      // Create a temporary scenario and run it
-      const { data: tmpScenario } = await apiClient.post<ScheduleScenario>('/api/scenarios', {
-        name: `[What-If] ${whatIfText.slice(0, 40)}`,
-        machine_order_id: selectedMachineOrderId,
-        objective_mode: 'FINISH_BY_DATE',
-        resource_set_json: {},
-        is_active: false,
-        is_baseline: false,
-      });
-      const { data: run } = await apiClient.post<{ task_id: string }>(`/api/scenarios/${tmpScenario.id}/run`);
-      setWhatIfResult(`Task avviato (ID: ${run.task_id}). Scenario temporaneo: ${tmpScenario.name}`);
-    } catch {
-      setWhatIfResult('Errore nella simulazione what-if.');
-    } finally {
-      setWhatIfLoading(false);
-    }
-  }
-
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
@@ -360,21 +690,55 @@ export default function ScenarioManager() {
 
   return (
     <div className="h-full overflow-auto p-6 space-y-6">
-      {/* ── Header ──────────────────────────────────────────────── */}
+      {showCreate && selectedMachineOrderId && (
+        <NewScenarioModal
+          machineOrderId={selectedMachineOrderId}
+          onClose={() => setShowCreate(false)}
+        />
+      )}
+      {showGuide && <ScenarioGuideModal onClose={() => setShowGuide(false)} />}
+
+      {/* Header */}
       <div className="flex items-center justify-between">
-        <h1 className="text-lg font-bold">Scenario Manager</h1>
-        <button
-          onClick={() => setShowCreateModal(true)}
-          className="flex items-center gap-1.5 bg-primary text-primary-foreground rounded-lg px-3 py-1.5 text-sm hover:opacity-90"
-        >
-          <Plus size={14} /> Nuovo Scenario
-        </button>
+        <div>
+          <h1 className="text-lg font-bold">Scenario Manager</h1>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            Crea e confronta piani di scheduling alternativi per la macchina
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setShowGuide(true)}
+            className="flex items-center gap-1.5 border border-border rounded-lg px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            <Info size={14} /> Come funziona
+          </button>
+          <button
+            onClick={() => setShowCreate(true)}
+            disabled={!selectedMachineOrderId}
+            className="flex items-center gap-1.5 bg-primary text-primary-foreground rounded-lg px-3 py-1.5 text-sm hover:opacity-90 disabled:opacity-50"
+          >
+            <Plus size={14} /> Nuovo Scenario
+          </button>
+        </div>
       </div>
 
-      {/* ── Scenario cards ────────────────────────────────────────── */}
-      {machineScenarios.length === 0 ? (
+      {!selectedMachineOrderId && (
+        <div className="border border-amber-600/30 bg-amber-900/10 rounded-lg p-4 text-amber-200 text-sm">
+          Seleziona un machine order dal menu in alto per gestire i suoi scenari.
+        </div>
+      )}
+
+      {/* Griglia scenari */}
+      {machineScenarios.length === 0 && selectedMachineOrderId ? (
         <div className="border border-dashed border-border rounded-xl p-12 text-center text-muted-foreground text-sm">
-          Nessuno scenario. Crea il primo scenario con il pulsante sopra.
+          <p className="mb-3">Nessuno scenario. Crea il primo con il pulsante in alto a destra.</p>
+          <button
+            onClick={() => setShowGuide(true)}
+            className="text-primary underline text-xs"
+          >
+            Scopri come funzionano gli scenari →
+          </button>
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -394,136 +758,10 @@ export default function ScenarioManager() {
         </div>
       )}
 
-      {/* ── Comparison section ──────────────────────────────────── */}
+      {/* Confronto scenari */}
       {machineScenarios.length >= 2 && (
-        <section className="border border-border rounded-xl p-4">
-          <h2 className="text-sm font-semibold mb-3">Confronto Scenari</h2>
-
-          <div className="flex flex-wrap gap-2 items-end mb-3">
-            <div>
-              <label className="block text-xs mb-0.5">Scenario A</label>
-              <select
-                value={compareA}
-                onChange={(e) => setCompareA(e.target.value)}
-                className="border border-border rounded px-2 py-1 text-sm bg-background"
-              >
-                <option value="">Seleziona…</option>
-                {machineScenarios.map((s) => (
-                  <option key={s.id} value={s.id}>{s.name}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs mb-0.5">Scenario B</label>
-              <select
-                value={compareB}
-                onChange={(e) => setCompareB(e.target.value)}
-                className="border border-border rounded px-2 py-1 text-sm bg-background"
-              >
-                <option value="">Seleziona…</option>
-                {machineScenarios.map((s) => (
-                  <option key={s.id} value={s.id}>{s.name}</option>
-                ))}
-              </select>
-            </div>
-            <button
-              onClick={() => compareMutation.mutate()}
-              disabled={!compareA || !compareB || compareA === compareB || compareMutation.isPending}
-              className="px-3 py-1.5 bg-primary text-primary-foreground rounded text-sm disabled:opacity-50"
-            >
-              {compareMutation.isPending ? 'Confronto…' : 'Confronta'}
-            </button>
-          </div>
-
-          {compResult && (
-            <div className="space-y-3">
-              {/* KPI delta table */}
-              <table className="w-full text-xs border border-border rounded overflow-hidden">
-                <thead className="bg-muted">
-                  <tr>
-                    <th className="text-left px-2 py-1.5">KPI</th>
-                    <th className="text-center px-2 py-1.5">Delta (A−B)</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-border">
-                  <tr>
-                    <td className="px-2 py-1">Makespan (giorni)</td>
-                    <DeltaCell value={compResult.delta_makespan_days} />
-                  </tr>
-                  <tr>
-                    <td className="px-2 py-1">Operatori usati</td>
-                    <DeltaCell value={compResult.delta_operators} />
-                  </tr>
-                  <tr>
-                    <td className="px-2 py-1">Utilizzo risorse (%)</td>
-                    <DeltaCell value={
-                      compResult.delta_utilization != null
-                        ? compResult.delta_utilization * 100
-                        : null
-                    } unit="%" />
-                  </tr>
-                </tbody>
-              </table>
-
-              {/* AI comparison */}
-              <div>
-                <button
-                  onClick={() => aiCompareMutation.mutate()}
-                  disabled={aiCompareMutation.isPending}
-                  className="flex items-center gap-1.5 text-xs border border-border rounded px-2 py-1 hover:bg-accent disabled:opacity-50"
-                >
-                  <Bot size={12} />
-                  {aiCompareMutation.isPending ? 'Analisi AI…' : 'Analizza differenze con AI'}
-                </button>
-                {aiCompare && (
-                  <div className="mt-2 p-3 rounded bg-muted text-xs whitespace-pre-wrap">
-                    {aiCompare}
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-        </section>
-      )}
-
-      {/* ── What-if section ──────────────────────────────────────── */}
-      {selectedId && (
-        <section className="border border-border rounded-xl p-4">
-          <h2 className="text-sm font-semibold mb-3">Simulazione What-If</h2>
-          <div className="flex gap-2">
-            <input
-              value={whatIfText}
-              onChange={(e) => setWhatIfText(e.target.value)}
-              placeholder="Se aggiungo N operatori ELECTRICAL al workcenter WC-BERGAMO…"
-              className="flex-1 border border-border rounded px-2 py-1.5 text-sm bg-background"
-            />
-            <button
-              onClick={handleWhatIf}
-              disabled={!whatIfText.trim() || whatIfLoading}
-              className="px-3 py-1.5 bg-primary text-primary-foreground rounded text-sm disabled:opacity-50 flex items-center gap-1"
-            >
-              {whatIfLoading && <Loader2 size={12} className="animate-spin" />}
-              Stima impatto
-            </button>
-          </div>
-          {whatIfResult && (
-            <p className="mt-2 text-xs text-muted-foreground bg-muted rounded p-2">{whatIfResult}</p>
-          )}
-        </section>
-      )}
-
-      {/* Create modal */}
-      {showCreateModal && selectedMachineOrderId && (
-        <NewScenarioModal
-          machineOrderId={selectedMachineOrderId}
-          onClose={() => setShowCreateModal(false)}
-          onCreated={() => {
-            setShowCreateModal(false);
-            qc.invalidateQueries({ queryKey: ['scenarios'] });
-          }}
-        />
+        <CompareSection scenarios={machineScenarios} />
       )}
     </div>
   );
 }
-

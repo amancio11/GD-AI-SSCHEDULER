@@ -64,6 +64,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str) -> None:
 from app.api.routes import orders, operators, reference_points, delays, missing_components
 from app.api.routes import export, ai, admin
 from app.api.routes.schedule import router as scenarios_router, schedule_router
+from app.api.routes.dag import router as dag_router
 
 API_PREFIX = "/api"
 
@@ -97,6 +98,7 @@ app.include_router(ai.router, prefix=API_PREFIX)
 # DB Admin: lettura e modifica diretta delle tabelle (solo per sviluppo)
 app.include_router(admin.router, prefix=API_PREFIX)
 
+app.include_router(dag_router, prefix="/api")
 
 @app.on_event("startup")
 async def on_startup() -> None:
