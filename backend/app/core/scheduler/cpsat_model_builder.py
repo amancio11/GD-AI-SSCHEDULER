@@ -504,18 +504,55 @@ class CpsatModelBuilder:
         self._add_parent_wait_constraints()
         _log.info("Dopo parent_wait_constraints: %d constraints", len(self.model.Proto().constraints))
         self._add_missing_component_constraints()
-        _log.info("Dopo precedence_constraints: %d constraints", len(self.model.Proto().constraints))  
+        _log.info("Dopo missing_component_constraints: %d constraints", len(self.model.Proto().constraints))  
         self._set_objective(objective_mode, params)
+
+        """
+        PATCH: cpsat_model_builder.py — Fix obiettivi troppo simili
+        
+        PROBLEMA:
+        solver.parameters.stop_after_first_solution = True
+        fa sì che il solver trovi UNA soluzione e si fermi, ignorando l'obiettivo.
+        MINIMIZE_OPERATORS e MAXIMIZE_RESOURCE_UTILIZATION danno risultati identici.
+        
+        FIX:
+        - stop_after_first_solution = True SOLO se non c'è obiettivo (soddisfacibilità pura)
+        - Per gli obiettivi reali, dare al solver tempo di ottimizzare
+        - Aggiungere solution callback per log progressivo
+        
+        DOVE APPLICARE:
+        In build_and_solve(), DOPO la chiamata a _set_objective(),
+        SOSTITUIRE il blocco dei parametri solver.
+        """
 
         self.solver.parameters.max_time_in_seconds = self.TIMEOUT
         self.solver.parameters.num_search_workers = min(8, max(1, os.cpu_count() or 1))
-        # Permetti al solver di restituire la prima soluzione FEASIBLE trovata
-        # senza cercare l'ottimo — molto più veloce per istanze grandi.
-        self.solver.parameters.stop_after_first_solution = True
-        # FIX aggiuntivi:
-        self.solver.parameters.log_search_progress = True  # per debug in dev
-        self.solver.parameters.linearization_level = 1     # più veloce per problemi reali
-        self.solver.parameters.search_branching = 6        # PORTFOLIO_WITH_QUICK_RESTART
+        self.solver.parameters.log_search_progress = True
+        self.solver.parameters.linearization_level = 1
+        self.solver.parameters.search_branching = 6  # PORTFOLIO_WITH_QUICK_RESTART
+ 
+        # ── CRITICO: stop_after_first_solution SOLO se non c'è obiettivo ──
+        # Se il solver ha un obiettivo (Minimize/Maximize), deve avere tempo
+        # per ottimizzare. Altrimenti trova la stessa prima soluzione per tutti
+        # gli obiettivi, rendendo MINIMIZE_OPERATORS e MAXIMIZE_UTILIZATION identici.
+        has_objective = self.model.Proto().HasField("objective") or \
+                        self.model.Proto().HasField("floating_point_objective")
+        
+        if has_objective:
+            # Dai tempo al solver di ottimizzare, ma con un limite ragionevole
+            self.solver.parameters.stop_after_first_solution = False
+            # Per obiettivi che richiedono esplorazione, usa timeout più lungo
+            if objective_mode in ("MINIMIZE_OPERATORS", "MAXIMIZE_RESOURCE_UTILIZATION", "CUSTOM"):
+                self.solver.parameters.max_time_in_seconds = max(self.TIMEOUT, 60)
+            _log.info(
+                "Obiettivo %s attivo — solver ottimizzerà per max %ds",
+                objective_mode,
+                self.solver.parameters.max_time_in_seconds,
+            )
+        else:
+            # Nessun obiettivo → soddisfacibilità pura, prima soluzione va bene
+            self.solver.parameters.stop_after_first_solution = True
+            _log.info("Nessun obiettivo — stop_after_first_solution=True")
 
         
         
@@ -544,6 +581,37 @@ class CpsatModelBuilder:
             {cp_model.OPTIMAL: "OPTIMAL", cp_model.FEASIBLE: "FEASIBLE",
              cp_model.INFEASIBLE: "INFEASIBLE", cp_model.UNKNOWN: "UNKNOWN"}.get(status_code, "?"),
         )
+
+        if status_code in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            _log.info(
+                "Solver status=%s objective_value=%s wall_time=%.1fs",
+                "OPTIMAL" if status_code == cp_model.OPTIMAL else "FEASIBLE",
+                self.solver.ObjectiveValue() if has_objective else "N/A",
+                self.solver.WallTime(),
+            )
+            
+            # Log specifico per obiettivo
+            if objective_mode == "MINIMIZE_OPERATORS":
+                # Conta operatori effettivamente usati
+                used_count = sum(
+                    1 for oper_id in {oid for _, oid in self.vars.assignments}
+                    if any(
+                        self.solver.Value(bv) == 1
+                        for (op_id, oid2), bv in self.vars.assignments.items()
+                        if oid2 == oper_id
+                    )
+                )
+                _log.info("MINIMIZE_OPERATORS: %d operatori usati su %d disponibili",
+                          used_count, len(self.operators))
+            
+            elif objective_mode == "MAXIMIZE_RESOURCE_UTILIZATION":
+                total_work = sum(
+                    self.vars.op_duration.get(op_id, 0)
+                    for (op_id, oper_id), bv in self.vars.assignments.items()
+                    if self.solver.Value(bv) == 1
+                )
+                _log.info("MAXIMIZE_UTILIZATION: %d minuti totali di lavoro assegnati", total_work)
+
 
         status_map = {
             cp_model.OPTIMAL:    "OPTIMAL",

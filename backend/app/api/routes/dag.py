@@ -65,6 +65,14 @@ class DAGEdge(BaseModel):
     rp_predecessor_code: str | None
     rp_successor_code: str | None
     label: str | None
+    # ── NUOVI CAMPI SEMANTICI ──
+    semantic_label: str | None     # Es: "Op 'Montaggio idraulico' attende completamento 'Struttura Portante'"
+    blocked_operation_id: str | None       # ID dell'operazione bloccata (quella con il RP)
+    blocked_operation_desc: str | None     # Descrizione operazione bloccata
+    blocking_order_id: str | None          # ID dell'ordine che deve completarsi
+    blocking_order_desc: str | None        # Descrizione ordine bloccante
+    parent_order_id: str | None            # Ordine padre che contiene l'operazione bloccata
+    parent_order_desc: str | None          # Descrizione ordine padre
 
 
 class DAGFullResponse(BaseModel):
@@ -196,63 +204,138 @@ async def get_full_dag(
         ))
 
     # 9. Costruisci archi
-    edges: list[DAGEdge] = []
-    edge_idx = 0
-
-    # Archi BOM: figlio → padre
-    order_map: dict[uuid.UUID, ProductionOrder] = {o.id: o for o in orders_db}
+    # 9. Costruisci archi DAG — BOM + RP con SEMANTICA CHIARA
+    dag_edges: list[DAGEdge] = []
+    edge_counter = 0
+ 
+    # 9a. Archi BOM (parent-child)
     for po in orders_db:
-        if po.parent_order_id and po.parent_order_id in order_map:
-            edges.append(DAGEdge(
-                id=f"bom-{edge_idx}",
+        if po.parent_order_id:
+            edge_counter += 1
+            parent_po = next((o for o in orders_db if o.id == po.parent_order_id), None)
+            dag_edges.append(DAGEdge(
+                id=f"bom-{edge_counter}",
                 source=str(po.id),
                 target=str(po.parent_order_id),
                 edge_type="BOM_PARENT",
                 rp_predecessor_code=None,
                 rp_successor_code=None,
-                label="figlio di",
+                label=None,
+                semantic_label=None,
+                blocked_operation_id=None,
+                blocked_operation_desc=None,
+                blocking_order_id=None,
+                blocking_order_desc=None,
+                parent_order_id=None,
+                parent_order_desc=None,
             ))
-            edge_idx += 1
-
-    # Archi RP: target_pred_order → target_succ_order
+ 
+    # 9b. Archi RP_PRECEDENCE con semantica completa
+    #
+    # Per ogni arco nel DAG dei reference point (pred_rp → succ_rp):
+    #   - L'operazione del PADRE che ha reference_point_id = succ_rp 
+    #     è BLOCCATA da tutti gli ordini target di pred_rp (e figli)
+    #   - Ma nel DAG visivo l'arco è tra gli ORDINI TARGET dei due RP
+    #
+    # La semantica è: "l'ordine target di pred_rp deve completarsi
+    #   PRIMA che l'operazione con succ_rp possa iniziare"
+ 
+    # Mappa: rp_id → operazioni che lo referenziano (con info sull'ordine padre)
+    rp_to_operations: dict[uuid.UUID, list[tuple[Operation, ProductionOrder]]] = {}
+    for po in orders_db:
+        routing_id = routings_by_po.get(po.id)
+        if not routing_id:
+            continue
+        for op in ops_by_routing.get(routing_id, []):
+            if op.reference_point_id:
+                rp_to_operations.setdefault(op.reference_point_id, []).append((op, po))
+ 
     for prec in rp_precedences:
         pred_rp = rps.get(prec.predecessor_reference_point_id)
         succ_rp = rps.get(prec.reference_point_id)
         if not pred_rp or not succ_rp:
             continue
-
-        pred_order = material_to_order.get(pred_rp.target_order_material or "")
-        succ_order = material_to_order.get(succ_rp.target_order_material or "")
-        if not pred_order or not succ_order:
+ 
+        # Ordini target dei due RP
+        pred_target_order = material_to_order.get(pred_rp.target_order_material or "")
+        succ_target_order = material_to_order.get(succ_rp.target_order_material or "")
+        if not pred_target_order or not succ_target_order:
             continue
-
-        edges.append(DAGEdge(
-            id=f"rp-{edge_idx}",
-            source=str(pred_order.id),
-            target=str(succ_order.id),
+ 
+        # Operazione bloccata: quella dell'ordine PADRE che ha reference_point_id = succ_rp
+        blocked_ops = rp_to_operations.get(succ_rp.id, [])
+        blocked_op_desc = None
+        blocked_op_id = None
+        parent_order_desc = None
+        parent_order_id = None
+        if blocked_ops:
+            op, parent_po = blocked_ops[0]  # tipicamente 1 operazione per RP
+            blocked_op_id = str(op.id)
+            blocked_op_desc = op.description
+            parent_order_id = str(parent_po.id)
+            parent_order_desc = parent_po.description
+ 
+        # Label semantica leggibile
+        semantic = (
+            f"Op '{blocked_op_desc or '?'}' di '{parent_order_desc or '?'}' "
+            f"attende completamento di '{pred_target_order.description or pred_rp.target_order_material}'"
+        )
+ 
+        edge_counter += 1
+        dag_edges.append(DAGEdge(
+            id=f"rp-{edge_counter}",
+            source=str(pred_target_order.id),
+            target=str(succ_target_order.id),
             edge_type="RP_PRECEDENCE",
             rp_predecessor_code=pred_rp.code,
             rp_successor_code=succ_rp.code,
             label=f"{pred_rp.code} → {succ_rp.code}",
+            semantic_label=semantic,
+            blocked_operation_id=blocked_op_id,
+            blocked_operation_desc=blocked_op_desc,
+            blocking_order_id=str(pred_target_order.id),
+            blocking_order_desc=pred_target_order.description,
+            parent_order_id=parent_order_id,
+            parent_order_desc=parent_order_desc,
         ))
-        edge_idx += 1
 
-    # 10. Mappa RP per il frontend
-    rp_info: dict[str, dict[str, Any]] = {
-        str(rp_id): {
-            "id": str(rp_id),
+    # 10. Mappa reference_points arricchita
+    rp_info: dict[str, dict[str, Any]] = {}
+    for rp_id, rp in rps.items():
+        target_order = material_to_order.get(rp.target_order_material or "")
+        linked_ops = rp_to_operations.get(rp_id, [])
+        
+        rp_info[str(rp_id)] = {
             "code": rp.code,
             "name": rp.name,
             "target_level": rp.target_level.value if hasattr(rp.target_level, 'value') else str(rp.target_level),
             "target_order_material": rp.target_order_material,
+            "target_order_id": str(target_order.id) if target_order else None,
+            "target_order_description": target_order.description if target_order else None,
+            # NUOVO: quali operazioni sono vincolate da questo RP
+            "linked_operations": [
+                {
+                    "operation_id": str(op.id),
+                    "operation_desc": op.description,
+                    "parent_order_id": str(po.id),
+                    "parent_order_sap_id": po.sap_order_id,
+                    "parent_order_desc": po.description,
+                }
+                for op, po in linked_ops
+            ],
+            # NUOVO: semantica leggibile
+            "semantic": (
+                f"Vincola op di '{linked_ops[0][1].description}': "
+                f"non iniziare finché '{target_order.description if target_order else rp.target_order_material}' non è completo"
+            ) if linked_ops and target_order else (
+                f"Punta a '{target_order.description if target_order else rp.target_order_material}'"
+            ),
         }
-        for rp_id, rp in rps.items()
-    }
 
     return DAGFullResponse(
         machine_order_id=str(machine_order_id),
         machine_description=machine.description,
         orders=dag_orders,
-        edges=edges,
+        edges=dag_edges,
         reference_points=rp_info,
     )

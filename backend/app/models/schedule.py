@@ -38,13 +38,20 @@ class ScheduleScenario(UUIDMixin, TimestampMixin, Base):
     is_baseline: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     ai_explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    last_run_status = Mapped[str] = mapped_column(String, nullable=True)       # "OPTIMAL" | "FEASIBLE" | "INFEASIBLE" | "ERROR"
+    last_run_at = Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_run_makespan_days = Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_run_operators_used = Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_run_conflicts = Mapped[dict | None] = mapped_column(JSON, nullable=True)       # lista di conflitti se INFEASIBLE
+
     # Relationships
     machine_order: Mapped[MachineOrder] = relationship(
         "MachineOrder", back_populates="scenarios", lazy="selectin"
     )
     entries: Mapped[list[ScheduleEntry]] = relationship(
-        "ScheduleEntry", back_populates="scenario", lazy="selectin"
+        "ScheduleEntry", cascade="all, delete-orphan"
     )
+
 
     def __repr__(self) -> str:
         return (
@@ -57,7 +64,7 @@ class ScheduleEntry(UUIDMixin, Base):
     __tablename__ = "schedule_entries"
 
     scenario_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("schedule_scenarios.id"), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("schedule_scenarios.id", ondelete="CASCADE"), nullable=False, index=True
     )
     operation_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("operations.id"), nullable=False, index=True

@@ -595,6 +595,16 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
         parent_wait_constraints=parent_wait_constraints,
     )
 
+    # Salva risultato nello scenario
+    from datetime import datetime, timezone as tz
+    scenario_obj = session.get(ScheduleScenario, scenario_id)
+    if scenario_obj:
+        scenario_obj.last_run_status = solution.status
+        scenario_obj.last_run_at = datetime.now(tz.utc)
+        scenario_obj.last_run_makespan_days = makespan_days
+        scenario_obj.last_run_operators_used = solution.operators_used
+        scenario_obj.last_run_conflicts = solution.conflicts if solution.status == "INFEASIBLE" else None
+
     # ── Step 8: Persist new entries ───────────────────────────────────────────
     if solution.status in ("OPTIMAL", "FEASIBLE"):
         for entry_schema in solution.schedule_entries:

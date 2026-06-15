@@ -219,10 +219,37 @@ async def compare_scenarios_endpoint(
     ops_a = len({e.operator_id for e in gantt_a})
     ops_b = len({e.operator_id for e in gantt_b})
 
+    # Calcolo utilization per ogni scenario
+    def _calc_utilization(gantt: list[GanttEntry]) -> float | None:
+        if not gantt:
+            return None
+        # Tempo totale di lavoro assegnato
+        total_work_minutes = sum(
+            (e.end - e.start).total_seconds() / 60
+            for e in gantt
+        )
+        # Operatori distinti
+        unique_operators = {e.operator_id for e in gantt}
+        if not unique_operators:
+            return None
+        # Span totale dello scenario (min→max)
+        mn = min(e.start for e in gantt)
+        mx = max(e.end for e in gantt)
+        span_minutes = (mx - mn).total_seconds() / 60
+        if span_minutes <= 0:
+            return None
+        # Utilization = lavoro / (operatori × span)
+        max_capacity = len(unique_operators) * span_minutes
+        return round(total_work_minutes / max_capacity * 100, 1)
+    
+    util_a = _calc_utilization(gantt_a)
+    util_b = _calc_utilization(gantt_b)
+    delta_util = round(util_b - util_a, 1) if util_a is not None and util_b is not None else None
+ 
     return ScenarioComparisonResult(
         delta_makespan_days=delta_ms,
         delta_operators=ops_b - ops_a,
-        delta_utilization=None,
+        delta_utilization=delta_util,
         gantt_a=gantt_a,
         gantt_b=gantt_b,
     )
@@ -270,34 +297,30 @@ async def run_scenario(
 
 @schedule_router.get("/task/{task_id}")
 async def get_task_status(task_id: str) -> dict:
-    """Controlla lo stato di un task Celery.
-
-    Usato dal frontend per il polling post-scheduling.
-    Il meccanismo principale di notifica è il WebSocket, ma questo endpoint
-    permette un fallback via polling ogni 2 secondi.
-
-    Stati Celery:
-      PENDING   → in coda, non ancora preso da un worker
-      STARTED   → il worker ha iniziato a eseguirlo
-      SUCCESS   → completato con successo
-      FAILURE   → terminato con errore
-    """
     import os
     from celery import Celery
     from celery.result import AsyncResult
-
-    # Ricrea un'istanza Celery leggera solo per leggere il risultato dal backend Redis.
-    # Non importiamo celery_worker per evitare import circolari nel contesto FastAPI.
+ 
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
     _app = Celery(broker=redis_url, backend=redis_url)
     result = AsyncResult(task_id, app=_app)
-
-    return {
+ 
+    response = {
         "task_id": task_id,
         "status": result.status,
         "ready": result.ready(),
     }
-
+    
+    # Se il task è completato, includi il risultato del solver
+    if result.ready() and result.result:
+        solver_result = result.result
+        if isinstance(solver_result, dict):
+            response["solver_status"] = solver_result.get("status")  # OPTIMAL/FEASIBLE/INFEASIBLE
+            response["makespan_days"] = solver_result.get("makespan_days")
+            response["operators_used"] = solver_result.get("operators_used")
+            response["conflicts"] = solver_result.get("conflicts")
+    
+    return response
 
 
 @schedule_router.get("/scenario/{scenario_id}", response_model=list[ScheduleEntryRead])
