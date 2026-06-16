@@ -44,6 +44,7 @@ const NAV_ITEMS = [
    { to: '/dag',             label: 'DAG Viewer',          icon: GitFork },
   { to: '/database',        label: 'DB Explorer',         icon: Database },
   { to: '/scheduler-logic', label: 'Logica Scheduler',    icon: Cpu },
+  { to: '/simulator',       label: 'Operation Simulator', icon: Cpu },
 ];
 
 function Breadcrumb() {

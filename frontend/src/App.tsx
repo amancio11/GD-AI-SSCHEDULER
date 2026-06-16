@@ -14,6 +14,7 @@ import DBAdmin from './pages/DBAdmin';
 import DAGViewer from './pages/DAGViewer';
 import DatabaseExplorer from './pages/DatabaseExplorer';
 import SchedulerLogic from './pages/SchedulerLogic';
+import OperationSimulator  from './pages/OperationSimulator';
 
 export default function App() {
   return (
@@ -35,6 +36,7 @@ export default function App() {
           <Route path="/dag" element={<DAGViewer />} />
           <Route path="/database" element={<DatabaseExplorer />} />
           <Route path="/scheduler-logic" element={<SchedulerLogic />} />
+          <Route path="/simulator" element={<OperationSimulator />} />
         </Route>
       </Routes>
     </BrowserRouter>

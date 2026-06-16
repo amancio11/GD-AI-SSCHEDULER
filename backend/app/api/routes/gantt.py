@@ -261,3 +261,109 @@ async def get_enriched_gantt(
         "dependencies": dependencies_payload,
         "rp_markers": rp_markers_payload,
     }
+
+@router.get("/{scenario_id}/operations-flat")
+async def get_operations_flat(
+    scenario_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """
+    Lista piatta di tutte le operazioni schedulate per uno scenario.
+    Usata da OperationSimulator per mostrare lo stato corrente di ogni operazione
+    e permettere aggiornamenti interattivi.
+ 
+    Risponde a: GET /api/gantt/{scenario_id}/operations-flat
+    """
+    # 1) Verifica scenario
+    scenario = await db.get(ScheduleScenario, scenario_id)
+    if not scenario:
+        raise HTTPException(404, "Scenario non trovato")
+ 
+    # 2) Carica entries con tutte le relazioni necessarie in un solo round-trip
+    q = (
+        select(ScheduleEntry)
+        .where(ScheduleEntry.scenario_id == scenario_id)
+        .options(
+            # Catena: entry → operation → routing → production_order → workcenter
+            selectinload(ScheduleEntry.operation)
+            .selectinload(Operation.routing)
+            .selectinload(Routing.production_order)
+            .selectinload(ProductionOrder.workcenter),
+            # Workcenter diretto dell'operazione (se diverso dal PO)
+            selectinload(ScheduleEntry.operation).selectinload(Operation.workcenter),
+            # Reference point (per mostrare il codice RP)
+            selectinload(ScheduleEntry.operation).selectinload(Operation.reference_point),
+            # Operatore con il suo workcenter
+            selectinload(ScheduleEntry.operator).selectinload(Operator.workcenter),
+        )
+        .order_by(ScheduleEntry.scheduled_start)
+    )
+    res = await db.execute(q)
+    entries = list(res.scalars().all())
+ 
+    if not entries:
+        return []
+ 
+    # 3) Serializza in formato ScheduledOp atteso dal frontend
+    result: list[dict[str, Any]] = []
+    for e in entries:
+        op       = e.operation
+        po       = op.routing.production_order
+        operator = e.operator
+        wc       = operator.workcenter if operator else None
+ 
+        # Workcenter code: preferisce quello dell'operatore, fallback al PO
+        wc_code = (wc.code if wc else None) or (po.workcenter.code if po.workcenter else "—")
+ 
+        # Helper per serializzare enum (str o .value)
+        def ev(x: Any) -> str:
+            return x.value if hasattr(x, "value") else str(x)
+ 
+        result.append({
+            # Identificatori
+            "entry_id":   str(e.id),
+            "operation_id": str(op.id),
+ 
+            # Descrizione operazione
+            "operation_description": op.description or f"Op {op.sequence_number}",
+            "operation_type": ev(op.operation_type),
+ 
+            # Operatore
+            "operator_name": operator.full_name if operator else "—",
+            "operator_skill": ev(operator.skill) if operator else "—",
+ 
+            # Workcenter
+            "workcenter_code": wc_code,
+ 
+            # Ordine di produzione
+            "production_order_material": po.material_code or po.sap_order_id,
+            "production_order_level":    ev(po.level),
+            "parent_order_id": str(po.parent_order_id) if po.parent_order_id else None,
+ 
+            # Date pianificate (ISO 8601)
+            "scheduled_start": e.scheduled_start.isoformat() if e.scheduled_start else None,
+            "scheduled_end":   e.scheduled_end.isoformat()   if e.scheduled_end   else None,
+ 
+            # Date reali (nullable)
+            "actual_start": e.actual_start.isoformat() if e.actual_start else None,
+            "actual_end":   e.actual_end.isoformat()   if e.actual_end   else None,
+ 
+            # Stato schedule entry (SCHEDULED | IN_PROGRESS | COMPLETED | INTERRUPTED | DELAYED | STALE)
+            "entry_status": ev(e.status),
+ 
+            # Stato operazione (PENDING | IN_PROGRESS | COMPLETED | BLOCKED | INTERRUPTED)
+            "op_status":       ev(op.status),
+            "op_progress_pct": float(op.progress_pct or 0.0),
+ 
+            # Flag
+            "is_critical_path": False,   # TODO: collegare con critical_path() del solver
+            "is_manual_override": bool(e.is_manual_override),
+ 
+            # Reference Point (se presente)
+            "reference_point_code": op.reference_point.code if op.reference_point else None,
+ 
+            # Motivo interruzione
+            "interruption_reason": e.interruption_reason,
+        })
+ 
+    return result
