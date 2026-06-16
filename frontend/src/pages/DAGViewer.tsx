@@ -20,6 +20,7 @@
  */
 
 import { useEffect, useState, useCallback, useMemo } from 'react';
+import DAGViewerEnhanced from '../components/dag/DAGViewerEnhanced';
 import ReactFlow, {
   Background,
   Controls,
@@ -456,6 +457,7 @@ export default function DAGViewer() {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
+  const [dagViewMode, setDagViewMode] = useState<'BOM' | 'RP'>('RP');
   const [filters, setFilters] = useState<FilterState>({
     showBOM: true,
     showRP: true,
@@ -579,7 +581,38 @@ export default function DAGViewer() {
         </div>
 
         {/* Badge stato */}
-        <div style={{ display: 'flex', gap: '8px' }}>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          {/* View toggle */}
+          <div style={{ display: 'flex', borderRadius: '6px', overflow: 'hidden', border: '1px solid #374151', marginRight: '8px' }}>
+            <button
+              onClick={() => setDagViewMode('RP')}
+              style={{
+                padding: '4px 12px',
+                fontSize: '11px',
+                fontWeight: 600,
+                background: dagViewMode === 'RP' ? '#4f46e5' : 'transparent',
+                color: dagViewMode === 'RP' ? '#fff' : '#94a3b8',
+                border: 'none',
+                cursor: 'pointer',
+              }}
+            >
+              Priorità RP
+            </button>
+            <button
+              onClick={() => setDagViewMode('BOM')}
+              style={{
+                padding: '4px 12px',
+                fontSize: '11px',
+                fontWeight: 600,
+                background: dagViewMode === 'BOM' ? '#4f46e5' : 'transparent',
+                color: dagViewMode === 'BOM' ? '#fff' : '#94a3b8',
+                border: 'none',
+                cursor: 'pointer',
+              }}
+            >
+              BOM Completo
+            </button>
+          </div>
           {Object.entries(STATUS_COLORS).slice(0, 4).map(([s, c]) => (
             <span key={s} style={{
               padding: '2px 8px',
@@ -596,7 +629,15 @@ export default function DAGViewer() {
         </div>
       </div>
 
-      {/* React Flow */}
+      {/* View principale */}
+      {dagViewMode === 'RP' ? (
+        <div style={{ flex: 1, overflow: 'auto', padding: '16px', background: '#0f172a' }}>
+          <DAGViewerEnhanced
+            machineOrderId={selectedMachineOrderId ?? ''}
+            apiBase=""
+          />
+        </div>
+      ) : (
       <div style={{ flex: 1, position: 'relative' }}>
         <ReactFlow
           nodes={nodes}
@@ -703,6 +744,7 @@ export default function DAGViewer() {
           </div>
         )}
       </div>
+      )}
     </div>
   );
 }

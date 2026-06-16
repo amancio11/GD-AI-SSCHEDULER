@@ -19,6 +19,7 @@ import {
   WifiOff,
   Database,
   GitFork,
+  Cpu,
 } from 'lucide-react';
 import { useUiStore } from '../../store/uiStore';
 import { useAiStore } from '../../store/aiStore';
@@ -41,6 +42,8 @@ const NAV_ITEMS = [
   { to: '/export',           label: 'Export',             icon: Download },
   { to: '/db-admin',         label: 'DB Admin',           icon: Database },
    { to: '/dag',             label: 'DAG Viewer',          icon: GitFork },
+  { to: '/database',        label: 'DB Explorer',         icon: Database },
+  { to: '/scheduler-logic', label: 'Logica Scheduler',    icon: Cpu },
 ];
 
 function Breadcrumb() {

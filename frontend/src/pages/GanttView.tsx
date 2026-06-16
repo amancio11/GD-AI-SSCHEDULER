@@ -1,4 +1,5 @@
 import { useMemo, useState, useEffect } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { useGanttData, useScenarios } from '../api/hooks/useSchedule';
 import { useOperators } from '../api/hooks/useOperators';
 import { useMissingComponents } from '../api/hooks/useMissing';
@@ -6,6 +7,8 @@ import { useScheduleStore } from '../store/scheduleStore';
 import { useMachineStore } from '../store/machineStore';
 import GanttByOperator from '../components/gantt/GanttByOperator';
 import GanttByOrder from '../components/gantt/GanttByOrder';
+import AdvancedGantt from '../components/gantt/AdvancedGantt';
+import apiClient from '../api/client';
 import { PX_PER_MINUTE, type ZoomLevel } from '../components/gantt/ganttUtils';
 
 const ZOOM_LABELS: Record<ZoomLevel, string> = {
@@ -41,6 +44,12 @@ export default function GanttView() {
   const { data: entries = [], isLoading, isError } = useGanttData(activeScenarioId ?? undefined);
   const { data: operators = [] } = useOperators();
   const { data: missingComponents = [] } = useMissingComponents(selectedMachineOrderId ?? undefined);
+
+  const { data: enrichedGantt } = useQuery({
+    queryKey: ['gantt-enriched', activeScenarioId],
+    queryFn: () => apiClient.get(`/api/gantt/${activeScenarioId}`).then(r => r.data),
+    enabled: !!activeScenarioId,
+  });
 
   // Compute origin (min start) and total chart width
   const { originDate, totalWidth } = useMemo(() => {
@@ -111,6 +120,12 @@ export default function GanttView() {
             className={`px-3 py-1 ${ganttViewMode === 'BY_ORDER' ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'}`}
           >
             Per Ordine
+          </button>
+          <button
+            onClick={() => setGanttViewMode('ADVANCED' as any)}
+            className={`px-3 py-1 ${ganttViewMode === ('ADVANCED' as any) ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'}`}
+          >
+            Avanzato
           </button>
         </div>
 
@@ -224,6 +239,25 @@ export default function GanttView() {
           )}
         </div>
       </div>
+
+      {/* ── Gantt Avanzato ───────────────────────────────────────── */}
+      {ganttViewMode === ('ADVANCED' as any) && (
+        <div className="flex-1 overflow-auto p-4">
+          {enrichedGantt ? (
+            <AdvancedGantt
+              entries={enrichedGantt.entries}
+              dependencies={enrichedGantt.dependencies}
+              rpMarkers={enrichedGantt.rp_markers}
+              initialMode="BY_ORDER"
+              height={600}
+            />
+          ) : (
+            <div className="flex items-center justify-center h-40 text-muted-foreground text-sm">
+              {activeScenarioId ? 'Caricamento dati avanzati…' : 'Seleziona uno scenario.'}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -339,3 +339,127 @@ async def get_full_dag(
         edges=dag_edges,
         reference_points=rp_info,
     )
+
+
+# ── Endpoint arricchito per DAGViewerEnhanced ─────────────────────────────────
+
+@router.get("/{machine_order_id}/enriched")
+async def get_enriched_dag(
+    machine_order_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Restituisce il DAG dei Reference Point arricchito per DAGViewerEnhanced.
+
+    Include priorità topologica, descrizione ordine target e lista operazioni
+    vincolate. Usato da GET /api/dag/{machine_order_id}/enriched.
+    """
+    import networkx as nx
+
+    mo = await db.get(MachineOrder, machine_order_id)
+    if not mo:
+        raise HTTPException(404, "MachineOrder non trovato")
+
+    # 1. Tutti i RP del modello macchina
+    rp_q = select(ReferencePoint).where(
+        ReferencePoint.machine_model_id == mo.machine_model_id
+    )
+    rp_res = await db.execute(rp_q)
+    rps_list = list(rp_res.scalars().all())
+
+    # 2. Tutte le precedenze
+    prec_q = select(ReferencePointPrecedence).where(
+        ReferencePointPrecedence.machine_model_id == mo.machine_model_id
+    )
+    prec_res = await db.execute(prec_q)
+    precedences = list(prec_res.scalars().all())
+
+    # 3. Mappa material_code → ProductionOrder + operazioni
+    po_q = select(ProductionOrder).where(
+        ProductionOrder.machine_order_id == machine_order_id
+    )
+    po_res = await db.execute(po_q)
+    orders_list = list(po_res.scalars().all())
+    order_by_material: dict[str, ProductionOrder] = {
+        o.material_code: o for o in orders_list if o.material_code
+    }
+
+    # 4. Carica routings e operations
+    order_ids = [o.id for o in orders_list]
+    routing_result = await db.execute(
+        select(Routing).where(Routing.production_order_id.in_(order_ids))
+    )
+    routings_by_po_id: dict[uuid.UUID, uuid.UUID] = {
+        r.production_order_id: r.id for r in routing_result.scalars().all()
+    }
+    routing_ids = list(routings_by_po_id.values())
+    ops_by_routing_id: dict[uuid.UUID, list[Operation]] = {}
+    if routing_ids:
+        ops_result = await db.execute(
+            select(Operation).where(Operation.routing_id.in_(routing_ids))
+            .order_by(Operation.sequence_number)
+        )
+        for op in ops_result.scalars().all():
+            ops_by_routing_id.setdefault(op.routing_id, []).append(op)
+
+    # 5. Calcola priorità topologica via networkx
+    G = nx.DiGraph()
+    for rp in rps_list:
+        G.add_node(str(rp.id))
+    for prec in precedences:
+        G.add_edge(
+            str(prec.predecessor_reference_point_id),
+            str(prec.reference_point_id),
+        )
+
+    if not nx.is_directed_acyclic_graph(G):
+        raise HTTPException(500, "Il DAG dei Reference Point contiene cicli.")
+
+    generations = list(nx.topological_generations(G))
+    priority_by_node: dict[str, int] = {}
+    rank = 1
+    for gen in generations:
+        sorted_gen = sorted(
+            gen, key=lambda nid: next((r.code for r in rps_list if str(r.id) == nid), "")
+        )
+        for nid in sorted_gen:
+            priority_by_node[nid] = rank
+            rank += 1
+
+    # 6. Costruisci payload nodi
+    nodes_payload: list[dict[str, Any]] = []
+    for rp in rps_list:
+        target_order = order_by_material.get(rp.target_order_material or "")
+        ops_list: list[dict[str, str]] = []
+        if target_order:
+            routing_id = routings_by_po_id.get(target_order.id)
+            if routing_id:
+                for op in ops_by_routing_id.get(routing_id, []):
+                    ops_list.append({"id": str(op.id), "description": op.description or ""})
+
+        nodes_payload.append({
+            "id": str(rp.id),
+            "rp_code": rp.code,
+            "rp_label": rp.name,
+            "target_order_material": rp.target_order_material or "",
+            "target_order_description": (
+                target_order.description
+                if target_order
+                else "(non presente in questo ordine)"
+            ),
+            "target_level": (
+                rp.target_level.value if hasattr(rp.target_level, "value") else str(rp.target_level)
+            ),
+            "operations_count": len(ops_list),
+            "operations": ops_list,
+            "priority_rank": priority_by_node.get(str(rp.id), 0),
+        })
+
+    edges_payload = [
+        {
+            "from": str(prec.predecessor_reference_point_id),
+            "to": str(prec.reference_point_id),
+        }
+        for prec in precedences
+    ]
+
+    return {"nodes": nodes_payload, "edges": edges_payload}

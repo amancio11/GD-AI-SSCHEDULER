@@ -12,6 +12,8 @@ import AIAssistant from './pages/AIAssistant';
 import ExportPage from './pages/ExportPage';
 import DBAdmin from './pages/DBAdmin';
 import DAGViewer from './pages/DAGViewer';
+import DatabaseExplorer from './pages/DatabaseExplorer';
+import SchedulerLogic from './pages/SchedulerLogic';
 
 export default function App() {
   return (
@@ -31,6 +33,8 @@ export default function App() {
           <Route path="/export" element={<ExportPage />} />
           <Route path="/db-admin" element={<DBAdmin />} />
           <Route path="/dag" element={<DAGViewer />} />
+          <Route path="/database" element={<DatabaseExplorer />} />
+          <Route path="/scheduler-logic" element={<SchedulerLogic />} />
         </Route>
       </Routes>
     </BrowserRouter>
