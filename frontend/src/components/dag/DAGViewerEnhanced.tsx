@@ -1,41 +1,31 @@
 // frontend/src/components/dag/DAGViewerEnhanced.tsx
 //
-// DAG Viewer migliorato:
-// - Mostra descrizione ordine + materiale + numero di operazioni invece del solo codice RP
-// - Numero di priorità calcolato dall'ordine topologico
-// - Tooltip con elenco operazioni
-// - Highlight predecessori/successori al hover
-// - Legenda chiara sulla logica di precedenza
-//
-// Backend endpoint richiesto: GET /api/dag/{machine_order_id}/enriched
-// Schema risposta:
-// {
-//   nodes: [{ id, rp_code, rp_label, target_order_material, target_order_description,
-//             target_level, operations_count, operations: [{id, description}],
-//             priority_rank }],
-//   edges: [{ from, to }]
-// }
+// DAG Viewer RP — versione corretta
+// Fixes:
+//   1. machineOrderId vuoto/null → mostra "Seleziona un ordine macchina" invece di spinner infinito
+//   2. Errore fetch → mostra dettaglio errore HTTP per debug
+//   3. nodes/edges vuoti → mostra stato esplicito con suggerimento
+//   4. Layout dagre robusto: nodi isolati (senza archi) ricevono posizione griglia
+//   5. Hover highlight funziona su nodi isolati
 
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState } from "react";
 import ReactFlow, {
   Node,
   Edge,
   Background,
   Controls,
   MiniMap,
-  ConnectionMode,
   MarkerType,
   Handle,
   Position,
   useNodesState,
   useEdgesState,
+  ReactFlowProvider,
+  useReactFlow,
 } from "reactflow";
 import dagre from "dagre";
 import "reactflow/dist/style.css";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Info, GitBranch, Eye, EyeOff } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -84,11 +74,13 @@ interface Props {
 // LEVEL COLORS
 // ============================================================================
 
-const LEVEL_STYLE: Record<DagNode["target_level"], { bg: string; border: string; text: string }> = {
-  MACROAGGREGATE: { bg: "#CECBF6", border: "#534AB7", text: "#26215C" },
-  AGGREGATE:      { bg: "#9FE1CB", border: "#1D9E75", text: "#04342C" },
-  GROUP:          { bg: "#FAC775", border: "#BA7517", text: "#412402" },
+const LEVEL_STYLE: Record<string, { bg: string; border: string; text: string; badge: string }> = {
+  MACROAGGREGATE: { bg: "#CECBF6", border: "#534AB7", text: "#26215C", badge: "#534AB7" },
+  AGGREGATE:      { bg: "#9FE1CB", border: "#1D9E75", text: "#04342C", badge: "#1D9E75" },
+  GROUP:          { bg: "#FAC775", border: "#BA7517", text: "#412402", badge: "#BA7517" },
 };
+
+const FALLBACK_STYLE = { bg: "#E5E7EB", border: "#6B7280", text: "#1F2937", badge: "#6B7280" };
 
 // ============================================================================
 // CUSTOM NODE
@@ -99,52 +91,91 @@ interface RPNodeData {
   isHighlighted: boolean;
   isDimmed: boolean;
   onOpenOps: (node: DagNode) => void;
+  onHover: (id: string | null) => void;
 }
 
 function RPNode({ data }: { data: RPNodeData }): JSX.Element {
-  const { node, isHighlighted, isDimmed, onOpenOps } = data;
-  const style = LEVEL_STYLE[node.target_level];
+  const { node, isHighlighted, isDimmed, onOpenOps, onHover } = data;
+  const style = LEVEL_STYLE[node.target_level] ?? FALLBACK_STYLE;
+
   return (
     <div
+      onMouseEnter={() => onHover(node.id)}
+      onMouseLeave={() => onHover(null)}
+      onClick={() => onOpenOps(node)}
       style={{
         background: style.bg,
-        border: `1.5px solid ${style.border}`,
+        border: `2px solid ${isHighlighted ? style.border : style.border + "99"}`,
         borderRadius: 8,
         padding: "8px 12px",
-        minWidth: 200,
-        maxWidth: 240,
-        opacity: isDimmed ? 0.25 : 1,
-        boxShadow: isHighlighted ? `0 0 0 3px ${style.border}55` : "none",
-        transition: "all 0.15s ease",
+        minWidth: 210,
+        maxWidth: 250,
+        opacity: isDimmed ? 0.2 : 1,
+        boxShadow: isHighlighted ? `0 0 0 3px ${style.border}44, 0 4px 12px rgba(0,0,0,0.15)` : "0 1px 4px rgba(0,0,0,0.08)",
+        transition: "all 0.12s ease",
         cursor: "pointer",
         color: style.text,
         fontFamily: "system-ui, sans-serif",
+        userSelect: "none",
       }}
-      onClick={() => onOpenOps(node)}
     >
-      <Handle type="target" position={Position.Left} style={{ background: style.border }} />
+      <Handle type="target" position={Position.Left} style={{ background: style.border, width: 8, height: 8 }} />
+
+      {/* Header: priorità + materiale + badge livello */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, marginBottom: 4 }}>
-        <span style={{ fontSize: 11, fontWeight: 600, fontFamily: "ui-monospace, monospace" }}>
+        <span style={{
+          fontSize: 10,
+          fontWeight: 700,
+          fontFamily: "ui-monospace, monospace",
+          opacity: 0.75,
+        }}>
           #{node.priority_rank} · {node.target_order_material}
         </span>
         <span style={{
           fontSize: 9,
-          fontWeight: 500,
-          background: style.border,
+          fontWeight: 600,
+          background: style.badge,
           color: "white",
           padding: "1px 6px",
           borderRadius: 8,
+          letterSpacing: "0.03em",
+          flexShrink: 0,
         }}>
-          {node.target_level.slice(0, 3)}
+          {node.target_level === "MACROAGGREGATE" ? "MA" : node.target_level === "AGGREGATE" ? "AGG" : "GRP"}
         </span>
       </div>
-      <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 2, lineHeight: 1.25 }}>
+
+      {/* Descrizione ordine */}
+      <div style={{
+        fontSize: 12,
+        fontWeight: 600,
+        marginBottom: 3,
+        lineHeight: 1.3,
+        whiteSpace: "nowrap",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+      }}>
         {node.target_order_description}
       </div>
-      <div style={{ fontSize: 10, opacity: 0.7 }}>
-        {node.operations_count} operazion{node.operations_count === 1 ? "e" : "i"} · {node.rp_code}
+
+      {/* Codice RP + contatore op */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 4 }}>
+        <span style={{ fontSize: 10, opacity: 0.6, fontFamily: "ui-monospace, monospace" }}>
+          {node.rp_code}
+        </span>
+        <span style={{
+          fontSize: 10,
+          background: style.border + "22",
+          color: style.text,
+          padding: "1px 5px",
+          borderRadius: 6,
+          fontWeight: 500,
+        }}>
+          {node.operations_count} op{node.operations_count !== 1 ? "." : "."}
+        </span>
       </div>
-      <Handle type="source" position={Position.Right} style={{ background: style.border }} />
+
+      <Handle type="source" position={Position.Right} style={{ background: style.border, width: 8, height: 8 }} />
     </div>
   );
 }
@@ -152,64 +183,114 @@ function RPNode({ data }: { data: RPNodeData }): JSX.Element {
 const nodeTypes = { rp: RPNode };
 
 // ============================================================================
-// LAYOUT (dagre)
+// LAYOUT — dagre con fallback griglia per nodi isolati
 // ============================================================================
 
-function autoLayout(nodes: Node[], edges: Edge[]): { nodes: Node[]; edges: Edge[] } {
-  const g = new dagre.graphlib.Graph();
-  g.setGraph({ rankdir: "LR", nodesep: 30, ranksep: 80 });
-  g.setDefaultEdgeLabel(() => ({}));
+function autoLayout(
+  rfNodes: Node[],
+  rfEdges: Edge[]
+): { nodes: Node[]; edges: Edge[] } {
+  if (rfNodes.length === 0) return { nodes: [], edges: [] };
 
-  nodes.forEach((n) => g.setNode(n.id, { width: 220, height: 70 }));
-  edges.forEach((e) => g.setEdge(e.source, e.target));
+  const NODE_W = 250;
+  const NODE_H = 80;
 
-  dagre.layout(g);
+  // Nodi che compaiono in almeno un arco
+  const connected = new Set<string>();
+  rfEdges.forEach((e) => { connected.add(e.source); connected.add(e.target); });
 
-  const laidOut = nodes.map((n) => {
-    const pos = g.node(n.id);
-    return { ...n, position: { x: pos.x - 110, y: pos.y - 35 } };
+  const connectedNodes = rfNodes.filter((n) => connected.has(n.id));
+  const isolatedNodes  = rfNodes.filter((n) => !connected.has(n.id));
+
+  // Layout dagre solo sui nodi connessi
+  const laidOut: Node[] = [];
+
+  if (connectedNodes.length > 0) {
+    const g = new dagre.graphlib.Graph();
+    g.setGraph({ rankdir: "LR", nodesep: 40, ranksep: 100, marginx: 20, marginy: 20 });
+    g.setDefaultEdgeLabel(() => ({}));
+    connectedNodes.forEach((n) => g.setNode(n.id, { width: NODE_W, height: NODE_H }));
+    rfEdges.forEach((e) => {
+      if (connected.has(e.source) && connected.has(e.target)) {
+        g.setEdge(e.source, e.target);
+      }
+    });
+    dagre.layout(g);
+    connectedNodes.forEach((n) => {
+      const pos = g.node(n.id);
+      laidOut.push({ ...n, position: { x: pos.x - NODE_W / 2, y: pos.y - NODE_H / 2 } });
+    });
+  }
+
+  // Nodi isolati → griglia sotto i connessi
+  const maxY = laidOut.length > 0
+    ? Math.max(...laidOut.map((n) => n.position.y)) + NODE_H + 60
+    : 0;
+  const COLS = Math.max(1, Math.ceil(Math.sqrt(isolatedNodes.length)));
+  isolatedNodes.forEach((n, i) => {
+    const col = i % COLS;
+    const row = Math.floor(i / COLS);
+    laidOut.push({
+      ...n,
+      position: {
+        x: col * (NODE_W + 30),
+        y: maxY + row * (NODE_H + 30),
+      },
+    });
   });
 
-  return { nodes: laidOut, edges };
+  return { nodes: laidOut, edges: rfEdges };
 }
 
 // ============================================================================
-// COMPONENT
+// INNER COMPONENT (accede a useReactFlow)
 // ============================================================================
 
-export default function DAGViewerEnhanced({ machineOrderId, apiBase = "" }: Props): JSX.Element {
-  const [data, setData] = useState<EnrichedDagResponse | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
+function DAGInner({ machineOrderId, apiBase = "" }: Props): JSX.Element {
+  const [data, setData]     = useState<EnrichedDagResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError]   = useState<string | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [opsDialogNode, setOpsDialogNode] = useState<DagNode | null>(null);
-  const [showLegend, setShowLegend] = useState<boolean>(true);
 
+  const { fitView } = useReactFlow();
+  const [nodes, setNodes, onNodesChange] = useNodesState([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+
+  // ── Fetch ──────────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!machineOrderId) {
-      setLoading(false);
+    if (!machineOrderId || machineOrderId.trim() === "") {
       setData(null);
+      setLoading(false);
+      setError(null);
       return;
     }
     let cancelled = false;
     setLoading(true);
+    setError(null);
+
+    const url = `${apiBase}/api/dag/${machineOrderId}/enriched`;
     axios
-      .get<EnrichedDagResponse>(`${apiBase}/api/dag/${machineOrderId}/enriched`)
+      .get<EnrichedDagResponse>(url)
       .then((r) => {
         if (!cancelled) setData(r.data);
       })
       .catch((err) => {
-        if (!cancelled) setError(String(err));
+        if (!cancelled) {
+          const msg = err?.response
+            ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data)}`
+            : String(err);
+          setError(msg);
+        }
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
-    return () => {
-      cancelled = true;
-    };
+
+    return () => { cancelled = true; };
   }, [machineOrderId, apiBase]);
 
-  // Build adjacency for highlight
+  // ── Adiacenza per highlight ─────────────────────────────────────────────────
   const adjacency = useMemo(() => {
     const preds = new Map<string, Set<string>>();
     const succs = new Map<string, Set<string>>();
@@ -227,31 +308,28 @@ export default function DAGViewerEnhanced({ machineOrderId, apiBase = "" }: Prop
   const highlighted = useMemo(() => {
     if (!hoveredId || !data) return new Set<string>();
     const result = new Set<string>([hoveredId]);
+    // Predecessori
     const stack = [hoveredId];
     while (stack.length) {
       const cur = stack.pop()!;
       for (const p of adjacency.preds.get(cur) ?? []) {
-        if (!result.has(p)) {
-          result.add(p);
-          stack.push(p);
-        }
+        if (!result.has(p)) { result.add(p); stack.push(p); }
       }
     }
+    // Successori
     const stack2 = [hoveredId];
     while (stack2.length) {
       const cur = stack2.pop()!;
       for (const s of adjacency.succs.get(cur) ?? []) {
-        if (!result.has(s)) {
-          result.add(s);
-          stack2.push(s);
-        }
+        if (!result.has(s)) { result.add(s); stack2.push(s); }
       }
     }
     return result;
   }, [hoveredId, adjacency, data]);
 
-  const { initialNodes, initialEdges } = useMemo(() => {
-    if (!data) return { initialNodes: [], initialEdges: [] };
+  // ── Costruisce nodi/archi React Flow e applica layout ──────────────────────
+  useEffect(() => {
+    if (!data) { setNodes([]); setEdges([]); return; }
 
     const rfNodes: Node[] = (data.nodes ?? []).map((n) => ({
       id: n.id,
@@ -262,12 +340,13 @@ export default function DAGViewerEnhanced({ machineOrderId, apiBase = "" }: Prop
         isHighlighted: hoveredId !== null && highlighted.has(n.id),
         isDimmed: hoveredId !== null && !highlighted.has(n.id),
         onOpenOps: (node: DagNode) => setOpsDialogNode(node),
+        onHover: setHoveredId,
       } as RPNodeData,
     }));
 
     const rfEdges: Edge[] = (data.edges ?? []).map((e, i) => {
       const isHl = hoveredId !== null && highlighted.has(e.from) && highlighted.has(e.to);
-      const isDimmed = hoveredId !== null && !isHl;
+      const isDim = hoveredId !== null && !isHl;
       return {
         id: `e-${i}`,
         source: e.from,
@@ -275,175 +354,245 @@ export default function DAGViewerEnhanced({ machineOrderId, apiBase = "" }: Prop
         type: "smoothstep",
         animated: isHl,
         style: {
-          stroke: isHl ? "#534AB7" : "#999",
-          strokeWidth: isHl ? 2.5 : 1.2,
-          opacity: isDimmed ? 0.15 : 1,
-          transition: "all 0.15s",
+          stroke: isHl ? "#534AB7" : "#94a3b8",
+          strokeWidth: isHl ? 2.5 : 1.5,
+          opacity: isDim ? 0.1 : 0.8,
+          transition: "all 0.12s",
         },
         markerEnd: {
           type: MarkerType.ArrowClosed,
-          color: isHl ? "#534AB7" : "#999",
-          width: 14,
-          height: 14,
+          color: isHl ? "#534AB7" : "#94a3b8",
+          width: 16,
+          height: 16,
         },
       };
     });
 
-    const laid = autoLayout(rfNodes, rfEdges);
-    return { initialNodes: laid.nodes, initialEdges: laid.edges };
+    const { nodes: laidNodes, edges: laidEdges } = autoLayout(rfNodes, rfEdges);
+    setNodes(laidNodes);
+    setEdges(laidEdges);
+
+    // fitView dopo che React Flow ha renderizzato
+    setTimeout(() => fitView({ padding: 0.12, duration: 300 }), 80);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data, hoveredId, highlighted]);
 
-  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
+  // ── Aggiorna solo data hover senza ricalcolare layout ─────────────────────
+  // (già gestito sopra includendo hoveredId nelle deps)
 
-  useEffect(() => {
-    setNodes(initialNodes);
-    setEdges(initialEdges);
-  }, [initialNodes, initialEdges, setNodes, setEdges]);
-
-  const onNodeMouseEnter = useCallback((_: unknown, n: Node) => {
-    setHoveredId(n.id);
-  }, []);
-  const onNodeMouseLeave = useCallback(() => {
-    setHoveredId(null);
-  }, []);
-
-  if (loading) {
+  // ── Stati di caricamento / errore / vuoto ──────────────────────────────────
+  if (!machineOrderId || machineOrderId.trim() === "") {
     return (
-      <Card>
-        <CardContent className="py-12 text-center text-stone-500">
-          Caricamento DAG…
-        </CardContent>
-      </Card>
+      <div style={centeredStyle}>
+        <span style={{ fontSize: 32, marginBottom: 12 }}>🔍</span>
+        <p style={{ color: "#64748b", fontSize: 14 }}>Seleziona un Ordine Macchina per visualizzare il DAG RP.</p>
+      </div>
     );
   }
 
-  if (error || !data) {
+  if (loading) {
     return (
-      <Card>
-        <CardContent className="py-12 text-center text-red-600">
-          Errore caricamento DAG: {error}
-        </CardContent>
-      </Card>
+      <div style={centeredStyle}>
+        <div style={spinnerStyle} />
+        <p style={{ color: "#64748b", fontSize: 13, marginTop: 12 }}>Caricamento DAG…</p>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div style={{ ...centeredStyle, flexDirection: "column", gap: 8, padding: 24 }}>
+        <span style={{ fontSize: 28 }}>⚠️</span>
+        <p style={{ color: "#dc2626", fontWeight: 600, fontSize: 14 }}>Errore nel caricamento del DAG</p>
+        <pre style={{
+          background: "#fef2f2",
+          border: "1px solid #fca5a5",
+          borderRadius: 6,
+          padding: "8px 12px",
+          fontSize: 11,
+          color: "#991b1b",
+          maxWidth: 480,
+          overflowX: "auto",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-all",
+        }}>
+          {error}
+        </pre>
+        <p style={{ color: "#6b7280", fontSize: 12 }}>
+          Verifica che il backend sia avviato e che l'endpoint{" "}
+          <code style={{ background: "#f1f5f9", padding: "1px 4px", borderRadius: 3 }}>
+            /api/dag/{"{machine_order_id}"}/enriched
+          </code>{" "}
+          risponda correttamente.
+        </p>
+      </div>
+    );
+  }
+
+  if (!data || (data.nodes ?? []).length === 0) {
+    return (
+      <div style={centeredStyle}>
+        <span style={{ fontSize: 32, marginBottom: 12 }}>📭</span>
+        <p style={{ color: "#64748b", fontSize: 14, fontWeight: 600 }}>DAG RP — 0 nodi</p>
+        <p style={{ color: "#94a3b8", fontSize: 12, marginTop: 4, textAlign: "center", maxWidth: 360 }}>
+          Non ci sono Reference Point configurati per questo modello macchina.
+          <br />
+          Verifica che il seed abbia popolato la tabella <code>reference_points</code>{" "}
+          e <code>reference_point_precedences</code>.
+        </p>
+        <p style={{ color: "#94a3b8", fontSize: 11, marginTop: 8 }}>
+          Machine Order ID: <code style={{ background: "#f1f5f9", padding: "1px 4px", borderRadius: 3 }}>{machineOrderId}</code>
+        </p>
+      </div>
     );
   }
 
   return (
     <>
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex items-center justify-between">
-            <CardTitle className="flex items-center gap-2">
-              <GitBranch className="h-5 w-5" />
-              DAG delle priorità — {(data.nodes ?? []).length} nodi, {(data.edges ?? []).length} archi
-            </CardTitle>
-            <div className="flex gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => setShowLegend((v) => !v)}
-              >
-                {showLegend ? <EyeOff className="h-3.5 w-3.5 mr-1" /> : <Eye className="h-3.5 w-3.5 mr-1" />}
-                Legenda
-              </Button>
+      {/* Legenda */}
+      <div style={{
+        position: "absolute",
+        top: 12,
+        right: 12,
+        zIndex: 10,
+        background: "rgba(255,255,255,0.97)",
+        border: "1px solid #e2e8f0",
+        borderRadius: 10,
+        padding: "10px 14px",
+        fontSize: 11,
+        boxShadow: "0 2px 8px rgba(0,0,0,0.08)",
+        display: "flex",
+        flexDirection: "column",
+        gap: 5,
+      }}>
+        <div style={{ fontWeight: 700, color: "#334155", marginBottom: 2 }}>Legenda livelli</div>
+        {(["MACROAGGREGATE", "AGGREGATE", "GROUP"] as const).map((lvl) => {
+          const s = LEVEL_STYLE[lvl];
+          return (
+            <div key={lvl} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <div style={{
+                width: 14, height: 14, borderRadius: 3,
+                background: s.bg, border: `2px solid ${s.border}`,
+                flexShrink: 0,
+              }} />
+              <span style={{ color: "#475569" }}>
+                {lvl === "MACROAGGREGATE" ? "Macroaggregato" : lvl === "AGGREGATE" ? "Aggregato" : "Gruppo"}
+              </span>
             </div>
-          </div>
-        </CardHeader>
-        <CardContent className="p-0">
-          {showLegend && (
-            <div className="mx-4 my-3 p-3 rounded-md bg-purple-50 border border-purple-200 text-xs text-purple-900 space-y-1">
-              <div className="flex items-center gap-2 font-semibold">
-                <Info className="h-3.5 w-3.5" />
-                Come leggere questo grafo
-              </div>
-              <div>
-                Ogni nodo è un <strong>ordine target</strong> di un Reference Point (un macroaggregato, aggregato o gruppo).
-                Il numero <span className="font-mono">#N</span> in alto è la priorità calcolata dall&apos;ordine topologico —
-                gli ordini con priorità minore devono completarsi prima di quelli con priorità maggiore.
-              </div>
-              <div>
-                Una freccia <span className="font-mono">A → B</span> significa: <strong>tutte le operazioni dell&apos;ordine A
-                e di tutti i suoi figli BOM devono terminare</strong> prima che le operazioni dell&apos;ordine B possano iniziare.
-                Lo scheduler traduce questo come <span className="font-mono">op_start(B) ≥ max(op_end di tutte le op del sottoalbero di A)</span>.
-              </div>
-              <div>
-                Passa il mouse su un nodo per evidenziare la sua catena di predecessori e successori. Clicca per vedere le operazioni.
-              </div>
-              <div className="pt-1 flex gap-3 flex-wrap">
-                <div className="flex items-center gap-1">
-                  <span className="inline-block w-3 h-3 rounded" style={{ background: LEVEL_STYLE.MACROAGGREGATE.bg, border: `1.5px solid ${LEVEL_STYLE.MACROAGGREGATE.border}` }} />
-                  Macroaggregato
-                </div>
-                <div className="flex items-center gap-1">
-                  <span className="inline-block w-3 h-3 rounded" style={{ background: LEVEL_STYLE.AGGREGATE.bg, border: `1.5px solid ${LEVEL_STYLE.AGGREGATE.border}` }} />
-                  Aggregato
-                </div>
-                <div className="flex items-center gap-1">
-                  <span className="inline-block w-3 h-3 rounded" style={{ background: LEVEL_STYLE.GROUP.bg, border: `1.5px solid ${LEVEL_STYLE.GROUP.border}` }} />
-                  Gruppo
-                </div>
-              </div>
-            </div>
-          )}
+          );
+        })}
+        <div style={{ borderTop: "1px solid #e2e8f0", marginTop: 4, paddingTop: 4, color: "#94a3b8", fontSize: 10 }}>
+          {(data.nodes ?? []).length} nodi · {(data.edges ?? []).length} archi
+          <br />
+          Hover = predecessori/successori · Click = operazioni
+        </div>
+      </div>
 
-          <div style={{ height: 600, background: "#FAFAF8" }}>
-            <ReactFlow
-              nodes={nodes}
-              edges={edges}
-              nodeTypes={nodeTypes}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
-              onNodeMouseEnter={onNodeMouseEnter}
-              onNodeMouseLeave={onNodeMouseLeave}
-              connectionMode={ConnectionMode.Loose}
-              proOptions={{ hideAttribution: true }}
-              fitView
-              fitViewOptions={{ padding: 0.15 }}
-            >
-              <Background gap={20} size={1} color="#E5E5E5" />
-              <Controls />
-              <MiniMap pannable zoomable />
-            </ReactFlow>
-          </div>
-        </CardContent>
-      </Card>
+      {/* React Flow canvas */}
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        nodeTypes={nodeTypes}
+        fitView
+        fitViewOptions={{ padding: 0.12 }}
+        style={{ background: "#f8fafc" }}
+        minZoom={0.05}
+        maxZoom={2.5}
+        attributionPosition="bottom-left"
+      >
+        <Background color="#e2e8f0" gap={20} />
+        <Controls style={{ background: "#fff", border: "1px solid #e2e8f0", borderRadius: 8 }} />
+        <MiniMap
+          style={{ background: "#f1f5f9", border: "1px solid #e2e8f0", borderRadius: 8 }}
+          nodeColor={(n) => {
+            const nd = n.data as RPNodeData;
+            return LEVEL_STYLE[nd?.node?.target_level]?.border ?? "#94a3b8";
+          }}
+        />
+      </ReactFlow>
 
-      {/* Operations dialog */}
-      <Dialog open={opsDialogNode !== null} onOpenChange={(v) => !v && setOpsDialogNode(null)}>
-        <DialogContent className="max-w-2xl">
+      {/* Dialog operazioni */}
+      <Dialog open={!!opsDialogNode} onOpenChange={() => setOpsDialogNode(null)}>
+        <DialogContent style={{ maxWidth: 480 }}>
           <DialogHeader>
             <DialogTitle>
-              {opsDialogNode?.target_order_material} — {opsDialogNode?.target_order_description}
+              {opsDialogNode?.rp_code} — {opsDialogNode?.target_order_description}
             </DialogTitle>
           </DialogHeader>
-          {opsDialogNode && (
-            <div className="space-y-3">
-              <div className="flex gap-2 flex-wrap text-xs">
-                <Badge variant="outline">RP: {opsDialogNode.rp_code}</Badge>
-                <Badge variant="outline">{opsDialogNode.target_level}</Badge>
-                <Badge variant="outline">Priorità #{opsDialogNode.priority_rank}</Badge>
-              </div>
-              <div>
-                <div className="text-sm font-semibold mb-2">
-                  Operazioni vincolate da questo nodo ({opsDialogNode.operations.length}):
-                </div>
-                <ul className="space-y-1 text-sm">
-                  {opsDialogNode.operations.map((op) => (
-                    <li key={op.id} className="flex items-start gap-2 p-2 bg-stone-50 rounded">
-                      <span className="font-mono text-xs text-stone-500 mt-0.5">→</span>
-                      <span>{op.description}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-              <div className="text-xs text-stone-500 italic border-t pt-3">
-                Tutte queste operazioni, e quelle di tutti gli ordini figli nella BOM, devono
-                terminare prima che le operazioni dei nodi successori possano iniziare.
-              </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <Badge variant="outline">{opsDialogNode?.target_level}</Badge>
+              <Badge variant="outline">{opsDialogNode?.target_order_material}</Badge>
+              <Badge variant="outline">Priorità #{opsDialogNode?.priority_rank}</Badge>
             </div>
-          )}
+            <p style={{ fontSize: 12, color: "#64748b", marginTop: 4 }}>
+              Operazioni dell'ordine target ({opsDialogNode?.operations_count ?? 0}):
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 280, overflowY: "auto" }}>
+              {(opsDialogNode?.operations ?? []).length === 0 ? (
+                <p style={{ color: "#94a3b8", fontSize: 12 }}>Nessuna operazione.</p>
+              ) : (
+                opsDialogNode?.operations.map((op) => (
+                  <div key={op.id} style={{
+                    background: "#f8fafc",
+                    border: "1px solid #e2e8f0",
+                    borderRadius: 6,
+                    padding: "6px 10px",
+                    fontSize: 12,
+                    color: "#334155",
+                  }}>
+                    <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 10, color: "#94a3b8" }}>
+                      {op.id.slice(0, 8)}
+                    </span>
+                    <br />
+                    {op.description || "(senza descrizione)"}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
         </DialogContent>
       </Dialog>
     </>
+  );
+}
+
+// ============================================================================
+// STYLES
+// ============================================================================
+
+const centeredStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  justifyContent: "center",
+  height: "100%",
+  minHeight: 300,
+  gap: 8,
+};
+
+const spinnerStyle: React.CSSProperties = {
+  width: 32,
+  height: 32,
+  border: "3px solid #e2e8f0",
+  borderTop: "3px solid #534AB7",
+  borderRadius: "50%",
+  animation: "spin 0.8s linear infinite",
+};
+
+// ============================================================================
+// PUBLIC EXPORT — wrappato in ReactFlowProvider
+// ============================================================================
+
+export default function DAGViewerEnhanced(props: Props): JSX.Element {
+  return (
+    <ReactFlowProvider>
+      <div style={{ width: "100%", height: "100%", position: "relative" }}>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+        <DAGInner {...props} />
+      </div>
+    </ReactFlowProvider>
   );
 }
