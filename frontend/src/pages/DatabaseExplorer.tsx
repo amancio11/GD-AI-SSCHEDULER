@@ -1,42 +1,34 @@
 // frontend/src/pages/DatabaseExplorer.tsx
 //
-// Pagina DB Explorer.
-// - Sidebar: lista tabelle con conteggio righe
-// - Pannello principale: builder query con filtri e join, tabella risultati paginata
-// - Export CSV del risultato corrente
+// FIX: crash "Cannot read properties of undefined (reading 'find')" e
+//      "Cannot read properties of undefined (reading 'length')"
+//
+// Causa: il Promise.all annidato dentro il .then di axios creava una race
+// condition — quando setCounts triggerava un re-render, tables era ancora []
+// nel closure e r.data era già fuori scope. Convertito tutto in async/await
+// con guard difensivi su ogni array.
 
-import React, { useEffect, useMemo, useState } from "react";
-import axios from "axios";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import apiClient from "../api/client";
+
+// Wrapper: usa apiClient (baseURL già configurata a http://localhost:8000)
+const api = apiClient;
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
+  Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import {
-  Database,
-  Filter,
-  Plus,
-  Trash2,
-  Play,
-  Download,
-  GitMerge,
-  ChevronLeft,
-  ChevronRight,
+  Database, Filter, Plus, Trash2, Play, Download,
+  GitMerge, ChevronLeft, ChevronRight,
 } from "lucide-react";
+
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 interface ColumnInfo {
   name: string;
@@ -45,19 +37,22 @@ interface ColumnInfo {
   primary_key: boolean;
   foreign_key: string[];
 }
+
 interface TableInfo {
   name: string;
   columns: ColumnInfo[];
 }
+
 interface JoinOption {
   table: string;
   on: string;
 }
+
 type FilterOp =
   | "eq" | "neq" | "gt" | "gte" | "lt" | "lte"
   | "like" | "ilike" | "in" | "not_in" | "is_null" | "not_null";
 
-interface Filter {
+interface FilterClause {
   column: string;
   op: FilterOp;
   value: string;
@@ -71,82 +66,164 @@ interface QueryResult {
   columns: string[];
 }
 
-const API = ""; // axios baseURL configurata altrove
-
 const OP_LABELS: Record<FilterOp, string> = {
-  eq: "=",
-  neq: "≠",
-  gt: ">",
-  gte: "≥",
-  lt: "<",
-  lte: "≤",
-  like: "like",
-  ilike: "ilike",
-  in: "in (csv)",
-  not_in: "not in (csv)",
-  is_null: "è null",
-  not_null: "non null",
+  eq: "=", neq: "≠", gt: ">", gte: "≥", lt: "<", lte: "≤",
+  like: "like", ilike: "ilike",
+  in: "in (csv)", not_in: "not in (csv)",
+  is_null: "è null", not_null: "non null",
 };
 
 const VALUELESS_OPS: FilterOp[] = ["is_null", "not_null"];
 const LIST_OPS: FilterOp[] = ["in", "not_in"];
 
-export default function DatabaseExplorer(): JSX.Element {
-  const [tables, setTables] = useState<TableInfo[]>([]);
-  const [counts, setCounts] = useState<Record<string, number>>({});
-  const [activeTable, setActiveTable] = useState<string>("");
-  const [joinable, setJoinable] = useState<JoinOption[]>([]);
-  const [selectedJoins, setSelectedJoins] = useState<string[]>([]);
-  const [filters, setFilters] = useState<Filter[]>([]);
-  const [orderBy, setOrderBy] = useState<string>("");
-  const [orderDir, setOrderDir] = useState<"asc" | "desc">("asc");
-  const [limit, setLimit] = useState<number>(50);
-  const [offset, setOffset] = useState<number>(0);
-  const [result, setResult] = useState<QueryResult | null>(null);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
+// ── Component ─────────────────────────────────────────────────────────────────
 
+export default function DatabaseExplorer(): JSX.Element {
+  const [tables, setTables]           = useState<TableInfo[]>([]);
+  const [counts, setCounts]           = useState<Record<string, number>>({});
+  const [activeTable, setActiveTable] = useState<string>("");
+  const [joinable, setJoinable]       = useState<JoinOption[]>([]);
+  const [selectedJoins, setSelectedJoins] = useState<string[]>([]);
+  const [filters, setFilters]         = useState<FilterClause[]>([]);
+  const [orderBy, setOrderBy]         = useState<string>("");
+  const [orderDir, setOrderDir]       = useState<"asc" | "desc">("asc");
+  const [limit, setLimit]             = useState<number>(50);
+  const [offset, setOffset]           = useState<number>(0);
+  const [result, setResult]           = useState<QueryResult | null>(null);
+  const [loading, setLoading]         = useState<boolean>(false);
+  const [error, setError]             = useState<string | null>(null);
+  const [initError, setInitError]     = useState<string | null>(null);
+  const [retryCount, setRetryCount]   = useState(0);
+
+  // ── Carica tabelle all'avvio ── async/await, no promise annidati ─────────
   useEffect(() => {
-    axios.get<{ tables: TableInfo[] }>(`${API}/api/database/tables`).then((r) => {
-      setTables(r.data.tables);
-      if (r.data.tables.length > 0 && !activeTable) {
-        setActiveTable(r.data.tables[0].name);
-      }
-      // Conteggi in parallelo
-      Promise.all(
-        r.data.tables.map((t) =>
-          axios
-            .get<{ count: number }>(`${API}/api/database/tables/${t.name}/count`)
-            .then((rr) => [t.name, rr.data.count] as [string, number])
-            .catch(() => [t.name, 0] as [string, number])
-        )
-      ).then((pairs) => {
+    let cancelled = false;
+
+    async function loadTables() {
+      try {
+        // Prova prima /api/database/tables (endpoint completo con colonne)
+        // Se fallisce, fallback a /api/admin/tables (solo nomi)
+        let raw: TableInfo[] | string[] | undefined;
+
+        try {
+          const r = await api.get<unknown>(`/api/database/tables`);
+          const data = r.data as Record<string, unknown>;
+          raw = data?.tables as TableInfo[] | string[] | undefined;
+        } catch (e1) {
+          // Primo endpoint fallito — prova admin
+          console.warn("[DatabaseExplorer] /api/database/tables fallito, provo /api/admin/tables", e1);
+          try {
+            const r2 = await api.get<unknown>(`/api/admin/tables`);
+            const data2 = r2.data as Record<string, unknown>;
+            raw = data2?.tables as string[] | undefined;
+          } catch (e2) {
+            throw new Error(`Entrambi gli endpoint falliti.\n/api/database/tables: ${e1}\n/api/admin/tables: ${e2}`);
+          }
+        }
+
+        if (!Array.isArray(raw)) {
+          console.error("[DatabaseExplorer] risposta raw:", raw);
+          setInitError(
+            `Risposta API non valida: tables non è un array.\n` +
+            `Valore ricevuto: ${JSON.stringify(raw)}\n\n` +
+            `Verifica che il router /api/database sia registrato in main.py ` +
+            `e che import app.models sia presente in database.py.`
+          );
+          return;
+        }
+
+        // Normalizza: se sono stringhe (admin endpoint), convertiamole in TableInfo
+        const normalized: TableInfo[] = raw.map((item) =>
+          typeof item === "string"
+            ? { name: item, columns: [] }
+            : { name: (item as TableInfo).name ?? "", columns: (item as TableInfo).columns ?? [] }
+        );
+
+        if (cancelled) return;
+        setTables(normalized);
+
+        if (normalized.length > 0) {
+          setActiveTable((prev) => prev || normalized[0].name);
+        }
+
+        // Carica conteggi in parallelo — separato dal set state di tables
+        const pairs = await Promise.all(
+          normalized.map(async (t) => {
+            try {
+              const rr = await api.get<{ count: number }>(
+                `/api/database/tables/${t.name}/count`
+              );
+              return [t.name, rr.data?.count ?? 0] as [string, number];
+            } catch {
+              return [t.name, 0] as [string, number];
+            }
+          })
+        );
+
+        if (cancelled) return;
         const m: Record<string, number> = {};
         for (const [k, v] of pairs) m[k] = v;
         setCounts(m);
-      });
-    });
-  }, []);
 
+      } catch (err) {
+        if (!cancelled) {
+          setInitError(`Errore caricamento tabelle: ${String(err)}`);
+        }
+      }
+    }
+
+    loadTables();
+    return () => { cancelled = true; };
+  }, [retryCount]);
+
+  // ── Cambia tabella attiva ─────────────────────────────────────────────────
   useEffect(() => {
     if (!activeTable) return;
-    axios
-      .get<{ joinable: JoinOption[] }>(`${API}/api/database/joins/${activeTable}`)
-      .then((r) => setJoinable(r.data.joinable))
-      .catch(() => setJoinable([]));
+    let cancelled = false;
+
+    api
+      .get<{ joinable: JoinOption[] }>(`/api/database/joins/${activeTable}`)
+      .then((r) => {
+        if (!cancelled) setJoinable(Array.isArray(r.data?.joinable) ? r.data.joinable : []);
+      })
+      .catch(() => { if (!cancelled) setJoinable([]); });
+
     setSelectedJoins([]);
     setFilters([]);
     setOrderBy("");
     setOffset(0);
     setResult(null);
+
+    return () => { cancelled = true; };
   }, [activeTable]);
 
-  const activeTableInfo = useMemo(
-    () => tables.find((t) => t.name === activeTable),
-    [tables, activeTable]
-  );
+  // ── Dati tabella attiva ────────────────────────────────────────────────────
+  // Guard: tables potrebbe essere vuoto al primo render
+  const activeTableInfo = useMemo<TableInfo | undefined>(() => {
+    if (!Array.isArray(tables) || !activeTable) return undefined;
+    return tables.find((t) => t.name === activeTable);
+  }, [tables, activeTable]);
 
-  const runQuery = async (newOffset?: number): Promise<void> => {
+  // ── Colonne disponibili (tabella attiva + join selezionati) ───────────────
+  const allColumnOptions = useMemo<{ label: string; value: string }[]>(() => {
+    const opts: { label: string; value: string }[] = [];
+    const cols = activeTableInfo?.columns ?? [];
+    for (const c of cols) {
+      opts.push({ label: c.name, value: c.name });
+    }
+    for (const jt of selectedJoins) {
+      const ti = Array.isArray(tables) ? tables.find((t) => t.name === jt) : undefined;
+      if (ti) {
+        for (const c of ti.columns ?? []) {
+          opts.push({ label: `${jt}.${c.name}`, value: `${jt}.${c.name}` });
+        }
+      }
+    }
+    return opts;
+  }, [activeTableInfo, selectedJoins, tables]);
+
+  // ── Esegui query ─────────────────────────────────────────────────────────
+  const runQuery = useCallback(async (newOffset?: number): Promise<void> => {
     if (!activeTable) return;
     setLoading(true);
     setError(null);
@@ -159,8 +236,7 @@ export default function DatabaseExplorer(): JSX.Element {
             if (VALUELESS_OPS.includes(f.op)) return { column: f.column, op: f.op };
             if (LIST_OPS.includes(f.op)) {
               return {
-                column: f.column,
-                op: f.op,
+                column: f.column, op: f.op,
                 value: f.value.split(",").map((s) => s.trim()).filter(Boolean),
               };
             }
@@ -172,7 +248,7 @@ export default function DatabaseExplorer(): JSX.Element {
         limit,
         offset: newOffset ?? offset,
       };
-      const r = await axios.post<QueryResult>(`${API}/api/database/query`, body);
+      const r = await api.post<QueryResult>(`/api/database/query`, body);
       setResult(r.data);
       if (newOffset !== undefined) setOffset(newOffset);
     } catch (err: unknown) {
@@ -181,11 +257,12 @@ export default function DatabaseExplorer(): JSX.Element {
     } finally {
       setLoading(false);
     }
-  };
+  }, [activeTable, filters, selectedJoins, orderBy, orderDir, limit, offset]);
 
+  // ── Export CSV ────────────────────────────────────────────────────────────
   const exportCsv = (): void => {
-    if (!result || result.rows.length === 0) return;
-    const cols = result.columns;
+    if (!result || !result.rows?.length) return;
+    const cols = result.columns ?? [];
     const escape = (v: unknown): string => {
       if (v === null || v === undefined) return "";
       const s = String(v);
@@ -203,27 +280,53 @@ export default function DatabaseExplorer(): JSX.Element {
     link.click();
   };
 
-  const allColumnOptions = useMemo(() => {
-    const opts: { label: string; value: string }[] = [];
-    if (activeTableInfo) {
-      for (const c of activeTableInfo.columns) {
-        opts.push({ label: c.name, value: c.name });
-      }
-    }
-    for (const jt of selectedJoins) {
-      const ti = tables.find((t) => t.name === jt);
-      if (ti) {
-        for (const c of ti.columns) {
-          opts.push({ label: `${jt}.${c.name}`, value: `${jt}.${c.name}` });
-        }
-      }
-    }
-    return opts;
-  }, [activeTableInfo, selectedJoins, tables]);
+  // ── Helpers filtri ────────────────────────────────────────────────────────
+  const addFilter = () =>
+    setFilters((prev) => [...prev, { column: allColumnOptions[0]?.value ?? "", op: "eq", value: "" }]);
+
+  const updateFilter = (i: number, patch: Partial<FilterClause>) =>
+    setFilters((prev) => prev.map((f, idx) => idx === i ? { ...f, ...patch } : f));
+
+  const removeFilter = (i: number) =>
+    setFilters((prev) => prev.filter((_, idx) => idx !== i));
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  if (initError) {
+    return (
+      <div className="flex items-center justify-center h-full p-8">
+        <div className="text-center max-w-2xl">
+          <p className="text-destructive font-semibold text-base mb-3">
+            ⚠️ Errore caricamento Database Explorer
+          </p>
+          <pre className="text-xs bg-muted p-4 rounded text-left whitespace-pre-wrap break-all mb-4 max-h-60 overflow-auto">
+            {initError}
+          </pre>
+          <div className="text-xs text-muted-foreground space-y-1 text-left bg-muted/50 rounded p-3">
+            <p className="font-semibold mb-2">Checklist risoluzione:</p>
+            <p>1. Il backend FastAPI è avviato? (<code>uvicorn app.main:app --reload</code>)</p>
+            <p>2. Il router database è registrato in <code>main.py</code>?</p>
+            <p className="font-mono bg-muted px-2 py-1 rounded">
+              from app.api.routes import database{"\n"}
+              app.include_router(database.router)
+            </p>
+            <p>3. In <code>database.py</code> c'è <code>import app.models</code> PRIMA della definizione del router?</p>
+            <p>4. Apri <code>/api/database/tables</code> nel browser — cosa risponde?</p>
+          </div>
+          <button
+            className="mt-4 px-4 py-2 bg-primary text-primary-foreground rounded text-sm"
+            onClick={() => { setInitError(null); setRetryCount(c => c + 1); }}
+          >
+            Riprova
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex gap-4 h-[calc(100vh-120px)]">
-      {/* Sidebar */}
+
+      {/* ── Sidebar tabelle ── */}
       <Card className="w-64 overflow-auto flex-shrink-0">
         <CardHeader className="pb-2">
           <CardTitle className="text-sm flex items-center gap-2">
@@ -243,173 +346,154 @@ export default function DatabaseExplorer(): JSX.Element {
                     : "hover:bg-stone-100 text-stone-700"
                 }`}
               >
-                <span>{t.name}</span>
-                <span className="text-stone-500 text-[10px]">
-                  {counts[t.name] ?? "…"}
+                <span className="truncate">{t.name}</span>
+                <span className="text-stone-400 text-[10px] ml-1 flex-shrink-0">
+                  {counts[t.name] !== undefined ? counts[t.name] : "…"}
                 </span>
               </button>
             ))}
+            {tables.length === 0 && (
+              <p className="text-xs text-muted-foreground px-2 py-4 text-center">
+                Caricamento…
+              </p>
+            )}
           </div>
         </CardContent>
       </Card>
 
-      {/* Main panel */}
-      <div className="flex-1 flex flex-col gap-3 overflow-hidden">
-        <Card>
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base flex items-center justify-between">
-              <span className="font-mono">{activeTable}</span>
-              <div className="flex gap-2">
-                <Button size="sm" onClick={() => runQuery(0)} disabled={loading}>
-                  <Play className="h-3.5 w-3.5 mr-1" />
-                  Esegui
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={exportCsv}
-                  disabled={!result || result.rows.length === 0}
-                >
-                  <Download className="h-3.5 w-3.5 mr-1" />
-                  CSV
-                </Button>
-              </div>
+      {/* ── Pannello principale ── */}
+      <div className="flex-1 flex flex-col gap-3 overflow-hidden min-w-0">
+
+        {/* Query builder */}
+        <Card className="flex-shrink-0">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm flex items-center gap-2">
+              <Filter className="h-4 w-4" />
+              Query Builder — <span className="font-mono">{activeTable || "—"}</span>
             </CardTitle>
           </CardHeader>
-          <CardContent className="space-y-3 pt-0">
-            {/* Joins */}
-            <div>
-              <div className="text-xs font-semibold text-stone-600 mb-1.5 flex items-center gap-1">
-                <GitMerge className="h-3.5 w-3.5" />
-                Join disponibili ({joinable.length})
-              </div>
-              <div className="flex gap-1.5 flex-wrap">
-                {joinable.map((j) => {
-                  const isSelected = selectedJoins.includes(j.table);
-                  return (
-                    <Badge
-                      key={j.table}
-                      variant={isSelected ? "default" : "outline"}
-                      className="cursor-pointer text-xs"
-                      onClick={() => {
-                        if (isSelected) {
-                          setSelectedJoins(selectedJoins.filter((t) => t !== j.table));
-                        } else {
-                          setSelectedJoins([...selectedJoins, j.table]);
-                        }
-                      }}
-                      title={j.on}
-                    >
-                      {isSelected ? "✓ " : "+ "}
-                      {j.table}
-                    </Badge>
-                  );
-                })}
-                {joinable.length === 0 && (
-                  <span className="text-xs text-stone-500 italic">
-                    Nessun join predefinito per questa tabella
-                  </span>
-                )}
-              </div>
-            </div>
+          <CardContent className="space-y-3">
 
-            {/* Filters */}
-            <div>
-              <div className="text-xs font-semibold text-stone-600 mb-1.5 flex items-center justify-between">
-                <span className="flex items-center gap-1">
-                  <Filter className="h-3.5 w-3.5" />
-                  Filtri
-                </span>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-6 text-xs"
-                  onClick={() =>
-                    setFilters([...filters, { column: "", op: "eq", value: "" }])
-                  }
-                >
-                  <Plus className="h-3 w-3 mr-1" />
-                  Aggiungi
-                </Button>
-              </div>
-              <div className="space-y-1.5">
-                {filters.map((f, idx) => (
-                  <div key={idx} className="flex gap-1.5 items-center">
-                    <Select
-                      value={f.column}
-                      onValueChange={(v) => {
-                        const copy = [...filters];
-                        copy[idx] = { ...copy[idx], column: v ?? '' };
-                        setFilters(copy);
-                      }}
-                    >
-                      <SelectTrigger className="h-8 w-[200px] text-xs">
-                        <SelectValue placeholder="Colonna" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {allColumnOptions.map((o) => (
-                          <SelectItem key={o.value} value={o.value}>
-                            {o.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <Select
-                      value={f.op}
-                      onValueChange={(v) => {
-                        const copy = [...filters];
-                        copy[idx] = { ...copy[idx], op: v as FilterOp };
-                        setFilters(copy);
-                      }}
-                    >
-                      <SelectTrigger className="h-8 w-[110px] text-xs">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {(Object.keys(OP_LABELS) as FilterOp[]).map((op) => (
-                          <SelectItem key={op} value={op}>
-                            {OP_LABELS[op]}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    {!VALUELESS_OPS.includes(f.op) && (
-                      <Input
-                        value={f.value}
-                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
-                          const copy = [...filters];
-                          copy[idx] = { ...copy[idx], value: e.target.value };
-                          setFilters(copy);
-                        }}
-                        placeholder={LIST_OPS.includes(f.op) ? "v1,v2,v3" : "valore"}
-                        className="h-8 text-xs flex-1"
-                      />
-                    )}
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-8 w-8 p-0"
-                      onClick={() => setFilters(filters.filter((_, i) => i !== idx))}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </Button>
-                  </div>
+            {/* Colonne tabella attiva */}
+            {activeTableInfo && (activeTableInfo.columns ?? []).length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {activeTableInfo.columns.map((c) => (
+                  <Badge
+                    key={c.name}
+                    variant={c.primary_key ? "default" : "secondary"}
+                    className="font-mono text-[10px]"
+                  >
+                    {c.name}
+                    {c.primary_key && " 🔑"}
+                    {(c.foreign_key ?? []).length > 0 && " 🔗"}
+                  </Badge>
                 ))}
-                {filters.length === 0 && (
-                  <div className="text-xs text-stone-500 italic">Nessun filtro</div>
-                )}
               </div>
+            )}
+
+            {/* Join */}
+            {joinable.length > 0 && (
+              <div className="flex flex-wrap gap-1 items-center">
+                <GitMerge className="h-3.5 w-3.5 text-muted-foreground" />
+                <span className="text-xs text-muted-foreground">Join:</span>
+                {joinable.map((j) => (
+                  <button
+                    key={j.table}
+                    onClick={() =>
+                      setSelectedJoins((prev) =>
+                        prev.includes(j.table)
+                          ? prev.filter((t) => t !== j.table)
+                          : [...prev, j.table]
+                      )
+                    }
+                    className={`text-[10px] px-2 py-0.5 rounded border font-mono ${
+                      selectedJoins.includes(j.table)
+                        ? "bg-indigo-100 border-indigo-400 text-indigo-800"
+                        : "border-stone-200 text-stone-600 hover:bg-stone-50"
+                    }`}
+                  >
+                    {j.table}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Filtri */}
+            <div className="space-y-1.5">
+              {filters.map((f, i) => (
+                <div key={i} className="flex gap-2 items-center">
+                  <Select
+                    value={f.column}
+                    onValueChange={(v) => updateFilter(i, { column: v ?? "" })}
+                  >
+                    <SelectTrigger className="h-7 text-xs w-40 font-mono">
+                      <SelectValue placeholder="Colonna" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {allColumnOptions.map((o) => (
+                        <SelectItem key={o.value} value={o.value}>
+                          {o.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+
+                  <Select
+                    value={f.op}
+                    onValueChange={(v) => updateFilter(i, { op: (v ?? "eq") as FilterOp })}
+                  >
+                    <SelectTrigger className="h-7 text-xs w-28">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {(Object.keys(OP_LABELS) as FilterOp[]).map((op) => (
+                        <SelectItem key={op} value={op}>
+                          {OP_LABELS[op]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+
+                  {!VALUELESS_OPS.includes(f.op) && (
+                    <Input
+                      className="h-7 text-xs flex-1"
+                      placeholder={LIST_OPS.includes(f.op) ? "val1, val2, …" : "valore"}
+                      value={f.value}
+                      onChange={(e) => updateFilter(i, { value: e.target.value })}
+                    />
+                  )}
+
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={() => removeFilter(i)}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              ))}
+
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-xs"
+                onClick={addFilter}
+                disabled={allColumnOptions.length === 0}
+              >
+                <Plus className="h-3.5 w-3.5 mr-1" /> Aggiungi filtro
+              </Button>
             </div>
 
-            {/* Order + limit */}
-            <div className="flex gap-2 items-center text-xs">
-              <span className="text-stone-600">Ordina per:</span>
-              <Select value={orderBy} onValueChange={(v) => setOrderBy(v ?? '')}>
-                <SelectTrigger className="h-8 w-[200px]">
+            {/* Order by + Limit */}
+            <div className="flex gap-2 items-center flex-wrap">
+              <span className="text-xs text-muted-foreground">Ordina per:</span>
+              <Select value={orderBy || "__none__"} onValueChange={(v) => setOrderBy((v ?? "") === "__none__" ? "" : (v ?? ""))}>
+                <SelectTrigger className="h-7 text-xs w-40 font-mono">
                   <SelectValue placeholder="—" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="">—</SelectItem>
+                  <SelectItem value="__none__">—</SelectItem>
                   {allColumnOptions.map((o) => (
                     <SelectItem key={o.value} value={o.value}>
                       {o.label}
@@ -417,77 +501,94 @@ export default function DatabaseExplorer(): JSX.Element {
                   ))}
                 </SelectContent>
               </Select>
-              <Select value={orderDir} onValueChange={(v) => setOrderDir((v ?? 'asc') as "asc" | "desc")}>
-                <SelectTrigger className="h-8 w-[80px]">
+
+              <Select value={orderDir} onValueChange={(v) => setOrderDir((v ?? "asc") as "asc" | "desc")}>
+                <SelectTrigger className="h-7 text-xs w-20">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="asc">asc</SelectItem>
-                  <SelectItem value="desc">desc</SelectItem>
+                  <SelectItem value="asc">ASC</SelectItem>
+                  <SelectItem value="desc">DESC</SelectItem>
                 </SelectContent>
               </Select>
-              <span className="text-stone-600 ml-4">Limit:</span>
-              <Select value={String(limit)} onValueChange={(v) => setLimit(Number(v ?? '50'))}>
-                <SelectTrigger className="h-8 w-[80px]">
+
+              <span className="text-xs text-muted-foreground ml-2">Limite:</span>
+              <Select value={String(limit)} onValueChange={(v) => setLimit(Number(v ?? "50"))}>
+                <SelectTrigger className="h-7 text-xs w-20">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {[25, 50, 100, 250, 500, 1000].map((n) => (
+                  {[25, 50, 100, 250, 500].map((n) => (
                     <SelectItem key={n} value={String(n)}>{n}</SelectItem>
                   ))}
                 </SelectContent>
               </Select>
+
+              <Button
+                size="sm"
+                className="h-7 text-xs ml-auto"
+                onClick={() => runQuery(0)}
+                disabled={loading || !activeTable}
+              >
+                <Play className="h-3.5 w-3.5 mr-1" />
+                {loading ? "Esecuzione…" : "Esegui"}
+              </Button>
+
+              {result && result.rows?.length > 0 && (
+                <Button size="sm" variant="outline" className="h-7 text-xs" onClick={exportCsv}>
+                  <Download className="h-3.5 w-3.5 mr-1" /> CSV
+                </Button>
+              )}
             </div>
 
             {error && (
-              <div className="p-2 text-xs bg-red-50 border border-red-200 rounded text-red-800">
-                {error}
-              </div>
+              <p className="text-xs text-destructive bg-destructive/10 rounded p-2">{error}</p>
             )}
           </CardContent>
         </Card>
 
-        {/* Results */}
-        <Card className="flex-1 overflow-hidden flex flex-col">
-          <CardHeader className="pb-2 flex flex-row items-center justify-between">
-            <CardTitle className="text-sm">
-              Risultati: {result ? `${result.rows.length} di ${result.total}` : "—"}
+        {/* Risultati */}
+        <Card className="flex-1 overflow-hidden flex flex-col min-h-0">
+          <CardHeader className="pb-2 flex-shrink-0">
+            <CardTitle className="text-sm flex items-center justify-between">
+              <span>
+                Risultati{" "}
+                {result ? `— ${result.rows?.length ?? 0} di ${result.total}` : "—"}
+              </span>
+              {result && (
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm" variant="ghost"
+                    disabled={offset === 0}
+                    onClick={() => runQuery(Math.max(0, offset - limit))}
+                    className="h-7"
+                  >
+                    <ChevronLeft className="h-3.5 w-3.5" />
+                  </Button>
+                  <span className="text-xs text-stone-600">
+                    {offset + 1}–{Math.min(offset + (result.rows?.length ?? 0), result.total)}
+                  </span>
+                  <Button
+                    size="sm" variant="ghost"
+                    disabled={offset + limit >= result.total}
+                    onClick={() => runQuery(offset + limit)}
+                    className="h-7"
+                  >
+                    <ChevronRight className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              )}
             </CardTitle>
-            {result && (
-              <div className="flex items-center gap-2">
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={offset === 0}
-                  onClick={() => runQuery(Math.max(0, offset - limit))}
-                  className="h-7"
-                >
-                  <ChevronLeft className="h-3.5 w-3.5" />
-                </Button>
-                <span className="text-xs text-stone-600">
-                  {offset + 1} – {Math.min(offset + result.rows.length, result.total)}
-                </span>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={offset + limit >= result.total}
-                  onClick={() => runQuery(offset + limit)}
-                  className="h-7"
-                >
-                  <ChevronRight className="h-3.5 w-3.5" />
-                </Button>
-              </div>
-            )}
           </CardHeader>
           <CardContent className="overflow-auto flex-1 p-0">
-            {result && result.rows.length > 0 ? (
+            {result && (result.rows?.length ?? 0) > 0 ? (
               <Table>
                 <TableHeader>
                   <TableRow>
-                    {result.columns.map((c) => (
-                      <TableHead key={c} className="text-xs font-mono whitespace-nowrap">
+                    {(result.columns ?? []).map((c) => (
+                      <TableHead key={c} className="text-xs font-mono whitespace-nowrap sticky top-0 bg-background">
                         {c.replace(`${activeTable}__`, "")}
-                        {c.startsWith(`${activeTable}__`) ? "" : (
+                        {!c.startsWith(`${activeTable}__`) && c.includes("__") && (
                           <span className="text-stone-400 text-[10px] ml-1">
                             ({c.split("__")[0]})
                           </span>
@@ -499,12 +600,10 @@ export default function DatabaseExplorer(): JSX.Element {
                 <TableBody>
                   {result.rows.map((row, ri) => (
                     <TableRow key={ri}>
-                      {result.columns.map((c) => (
-                        <TableCell key={c} className="text-xs font-mono whitespace-nowrap">
-                          {row[c] === null ? (
+                      {(result.columns ?? []).map((c) => (
+                        <TableCell key={c} className="text-xs font-mono whitespace-nowrap max-w-xs truncate">
+                          {row[c] === null || row[c] === undefined ? (
                             <span className="text-stone-400 italic">null</span>
-                          ) : typeof row[c] === "boolean" ? (
-                            String(row[c])
                           ) : (
                             String(row[c])
                           )}
@@ -516,7 +615,11 @@ export default function DatabaseExplorer(): JSX.Element {
               </Table>
             ) : (
               <div className="p-12 text-center text-stone-500 text-sm">
-                {loading ? "Caricamento…" : "Premi Esegui per visualizzare i risultati"}
+                {loading
+                  ? "Esecuzione query…"
+                  : result
+                  ? "Nessun risultato per i filtri selezionati"
+                  : "Seleziona una tabella e premi Esegui"}
               </div>
             )}
           </CardContent>

@@ -8,7 +8,7 @@
 //   4. Layout dagre robusto: nodi isolati (senza archi) ricevono posizione griglia
 //   5. Hover highlight funziona su nodi isolati
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import ReactFlow, {
   Node,
   Edge,
@@ -26,13 +26,14 @@ import ReactFlow, {
 import dagre from "dagre";
 import "reactflow/dist/style.css";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import axios from "axios";
+import apiClient from "../../api/client";
 
 // ============================================================================
 // TYPES
@@ -67,7 +68,6 @@ interface EnrichedDagResponse {
 
 interface Props {
   machineOrderId: string;
-  apiBase?: string;
 }
 
 // ============================================================================
@@ -246,7 +246,7 @@ function autoLayout(
 // INNER COMPONENT (accede a useReactFlow)
 // ============================================================================
 
-function DAGInner({ machineOrderId, apiBase = "" }: Props): JSX.Element {
+function DAGInner({ machineOrderId }: Props): JSX.Element {
   const [data, setData]     = useState<EnrichedDagResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError]   = useState<string | null>(null);
@@ -269,8 +269,8 @@ function DAGInner({ machineOrderId, apiBase = "" }: Props): JSX.Element {
     setLoading(true);
     setError(null);
 
-    const url = `${apiBase}/api/dag/${machineOrderId}/enriched`;
-    axios
+    const url = `/api/dag/${machineOrderId}/enriched`;
+    apiClient
       .get<EnrichedDagResponse>(url)
       .then((r) => {
         if (!cancelled) setData(r.data);
@@ -288,7 +288,7 @@ function DAGInner({ machineOrderId, apiBase = "" }: Props): JSX.Element {
       });
 
     return () => { cancelled = true; };
-  }, [machineOrderId, apiBase]);
+  }, [machineOrderId]);
 
   // ── Adiacenza per highlight ─────────────────────────────────────────────────
   const adjacency = useMemo(() => {
