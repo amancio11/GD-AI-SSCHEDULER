@@ -14,15 +14,20 @@ from __future__ import annotations
 
 import uuid
 import logging
+from collections import defaultdict
 from datetime import datetime, timezone
 from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.db.session import get_db
+from app.enums import ScheduleEntryStatus
 from app.models.schedule import ScheduleScenario, ScheduleEntry
-from app.models.routing import Operation
+from app.models.routing import Operation, Routing
+from app.core.state_engine.cpm_analyzer import CpmAnalyzer
+from app.models.production import ProductionOrder
 from app.models.operator import Operator
 from app.schemas.schedule import (
     ScheduleScenarioCreate,
@@ -33,6 +38,7 @@ from app.schemas.schedule import (
     GanttEntry,
     ScenarioComparisonResult,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +51,27 @@ GANTT_COLORS = [
 router = APIRouter(prefix="/scenarios", tags=["scenarios"])
 schedule_router = APIRouter(prefix="/schedule", tags=["schedule"])
 
+class CpmOperationResult(BaseModel):
+    operation_id: uuid.UUID
+    operation_description: str | None
+    production_order_material: str
+    early_start: int
+    early_finish: int
+    late_start: int
+    late_finish: int
+    total_float_minutes: int
+    is_critical: bool
+    delay_minutes: int
+    scheduled_start: str | None
+    scheduled_end: str | None
+ 
+ 
+class CpmAnalysisResponse(BaseModel):
+    scenario_id: uuid.UUID
+    epoch: str | None
+    makespan_minutes: int
+    critical_path_operation_ids: list[uuid.UUID]
+    operations: list[CpmOperationResult]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Scenarios CRUD
@@ -425,3 +452,208 @@ async def get_gantt_data(
         ))
 
     return gantt_entries
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CPM — Critical Path Method (early/late start-finish, total float)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# NOTA: questo endpoint vive sotto schedule_router (prefix "/schedule"), NON
+# sotto router (prefix "/scenarios"), per coerenza con il path documentato in
+# GUIDA_TECNICA.md sezione 9.4: GET /api/schedule/scenario/{id}/cpm.
+# Nella prima integrazione era stato registrato per errore su `router`
+# (→ /api/scenarios/scenario/{id}/cpm) — corretto qui.
+
+@schedule_router.get("/scenario/{scenario_id}/cpm", response_model=CpmAnalysisResponse)
+async def get_scenario_cpm_analysis(
+    scenario_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> CpmAnalysisResponse:
+    """Critical Path Method per uno scenario: early/late start-finish + slack.
+ 
+    A differenza di `is_critical_path` già presente in `gantt.py` (longest
+    path semplice su `entries_payload`), questo endpoint calcola anche il
+    TOTAL FLOAT di ogni operazione — quanto un'operazione può ritardare senza
+    impattare il makespan finale. È la stessa metrica che strumenti come
+    MS Project / Primavera P6 chiamano "Total Slack".
+ 
+    Usa lo stesso grafo di precedenza del solver CP-SAT (Meccanismo A diretto
+    + Meccanismo B espanso dai reference point), così lo slack calcolato è
+    coerente con i vincoli realmente applicati nell'ultimo solve.
+ 
+    Risponde a: GET /api/schedule/scenario/{scenario_id}/cpm
+    """
+    scenario = await db.get(ScheduleScenario, scenario_id)
+    if not scenario:
+        raise HTTPException(404, "Scenario non trovato")
+ 
+    # ── 1. Carica le schedule_entries correnti (non STALE) con join completo ──
+    entries_result = await db.execute(
+        select(ScheduleEntry)
+        .where(
+            ScheduleEntry.scenario_id == scenario_id,
+            ScheduleEntry.status != ScheduleEntryStatus.STALE,
+        )
+        .options(
+            selectinload(ScheduleEntry.operation)
+            .selectinload(Operation.routing)
+            .selectinload(Routing.production_order),
+            selectinload(ScheduleEntry.operation).selectinload(Operation.reference_point),
+        )
+    )
+    entries = list(entries_result.scalars().all())
+    if not entries:
+        return CpmAnalysisResponse(
+            scenario_id=scenario_id,
+            epoch=None,
+            makespan_minutes=0,
+            critical_path_operation_ids=[],
+            operations=[],
+        )
+ 
+    epoch = min(e.scheduled_start for e in entries)
+ 
+    # ── 2. Durate in minuti per ogni operazione (residuo se IN_PROGRESS) ───────
+    durations_minutes: dict[uuid.UUID, int] = {}
+    for e in entries:
+        dur = int((e.scheduled_end - e.scheduled_start).total_seconds() // 60)
+        durations_minutes[e.operation_id] = dur
+ 
+    # ── 3. Ricostruisce i vincoli di precedenza (stessa logica del solver) ────
+    # 3a. Meccanismo A: precedence_pairs dirette — attualmente vuoto nel
+    #     progetto (routing SIMULTANEOUS non crea precedenze interne).
+    precedence_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
+ 
+    # 3b. Meccanismo B (rp_order_constraints) + Tipo A (parent_wait): per il
+    #     CPM ci basta sapere "X deve finire prima che Y inizi" a livello di
+    #     singola operazione. Lo ricostruiamo dai reference_point_id presenti
+    #     sulle operazioni schedulate in questo scenario, usando la stessa
+    #     funzione di raccolta ricorsiva già usata in reschedule_engine.py.
+    rp_order_constraints = await _build_rp_constraints_for_cpm(db, entries)
+ 
+    # ── 4. CPM ──────────────────────────────────────────────────────────────
+    cpm_results = CpmAnalyzer().analyze(
+        durations_minutes=durations_minutes,
+        precedence_pairs=precedence_pairs,
+        rp_order_constraints=rp_order_constraints,
+    )
+    critical_ids = CpmAnalyzer().critical_path_ids(cpm_results)
+ 
+    # ── 5. Serializza risposta ──────────────────────────────────────────────
+    by_op_id = {e.operation_id: e for e in entries}
+    operations_payload: list[CpmOperationResult] = []
+    for op_id, r in cpm_results.items():
+        entry = by_op_id.get(op_id)
+        if entry is None:
+            continue
+        op = entry.operation
+        po = op.routing.production_order if op.routing else None
+        operations_payload.append(
+            CpmOperationResult(
+                operation_id=op_id,
+                operation_description=op.description,
+                production_order_material=po.material_code if po else "—",
+                early_start=r.early_start,
+                early_finish=r.early_finish,
+                late_start=r.late_start,
+                late_finish=r.late_finish,
+                total_float_minutes=r.total_float,
+                is_critical=r.is_critical,
+                delay_minutes=entry.delay_minutes,
+                scheduled_start=entry.scheduled_start.isoformat() if entry.scheduled_start else None,
+                scheduled_end=entry.scheduled_end.isoformat() if entry.scheduled_end else None,
+            )
+        )
+ 
+    makespan = max((r.early_finish for r in cpm_results.values()), default=0)
+ 
+    return CpmAnalysisResponse(
+        scenario_id=scenario_id,
+        epoch=epoch.isoformat() if epoch else None,
+        makespan_minutes=makespan,
+        critical_path_operation_ids=critical_ids,
+        operations=operations_payload,
+    )
+ 
+ 
+async def _build_rp_constraints_for_cpm(
+    db: AsyncSession,
+    entries: list[ScheduleEntry],
+) -> list[tuple[list[uuid.UUID], list[uuid.UUID]]]:
+    """Ricostruisce i vincoli (Tipo A: parent-wait) ai fini del CPM.
+ 
+    Per ogni operazione con reference_point_id valorizzato, l'operazione deve
+    iniziare dopo il completamento di TUTTE le operazioni schedulabili
+    dell'ordine target del RP (e dei suoi figli BOM ricorsivi) — stessa
+    semantica di `_collect_ops_recursive` in reschedule_engine.py.
+ 
+    Per il CPM ci interessa solo "chi blocca chi" tra le operazioni
+    EFFETTIVAMENTE presenti in questo scenario (entries correnti), quindi
+    filtriamo al volo sull'insieme degli operation_id già caricati.
+    """
+    from app.models.reference import ReferencePoint
+ 
+    op_ids_in_scenario = {e.operation_id for e in entries}
+    ops_by_id = {e.operation_id: e.operation for e in entries}
+ 
+    # Mappa reference_point_id → target_order_material
+    rp_ids = {op.reference_point_id for op in ops_by_id.values() if op.reference_point_id}
+    if not rp_ids:
+        return []
+ 
+    rp_result = await db.execute(select(ReferencePoint).where(ReferencePoint.id.in_(rp_ids)))
+    rps = {rp.id: rp for rp in rp_result.scalars().all()}
+ 
+    # Mappa material_code → production_order_id (solo tra gli ordini coinvolti)
+    po_ids = {op.routing.production_order_id for op in ops_by_id.values() if op.routing}
+    po_result = await db.execute(select(ProductionOrder).where(ProductionOrder.id.in_(po_ids)))
+    all_relevant_orders = {po.id: po for po in po_result.scalars().all()}
+ 
+    material_to_po_id = {po.material_code: po.id for po in all_relevant_orders.values()}
+ 
+    # Operazioni raggruppate per production_order_id (solo quelle nello scenario)
+    ops_by_order: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
+    for op_id, op in ops_by_id.items():
+        if op.routing:
+            ops_by_order[op.routing.production_order_id].append(op_id)
+ 
+    # children_map: serve per la raccolta ricorsiva. Carichiamo tutti i figli
+    # diretti (parent_order_id) dei production_order coinvolti, una volta sola.
+    children_result = await db.execute(
+        select(ProductionOrder.id, ProductionOrder.parent_order_id)
+        .where(ProductionOrder.parent_order_id.in_(po_ids))
+    )
+    children_map: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
+    for child_id, parent_id in children_result.all():
+        if parent_id:
+            children_map[parent_id].append(child_id)
+ 
+    def collect_ops_recursive(order_id: uuid.UUID) -> list[uuid.UUID]:
+        result: list[uuid.UUID] = []
+        stack = [order_id]
+        visited: set[uuid.UUID] = set()
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            result.extend(ops_by_order.get(current, []))
+            stack.extend(children_map.get(current, []))
+        return result
+ 
+    constraints: list[tuple[list[uuid.UUID], list[uuid.UUID]]] = []
+    for op_id, op in ops_by_id.items():
+        if op.reference_point_id is None:
+            continue
+        rp = rps.get(op.reference_point_id)
+        if rp is None or not rp.target_order_material:
+            continue
+        target_po_id = material_to_po_id.get(rp.target_order_material)
+        if target_po_id is None:
+            continue
+        ops_target = [o for o in collect_ops_recursive(target_po_id) if o in op_ids_in_scenario]
+        if not ops_target:
+            continue
+        constraints.append((ops_target, [op_id]))
+ 
+    return constraints

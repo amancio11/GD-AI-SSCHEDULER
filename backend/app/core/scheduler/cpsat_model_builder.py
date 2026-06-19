@@ -347,8 +347,8 @@ class CpsatModelBuilder:
             model.AddMaxEquality(makespan, list(v.op_end.values()))
             model.Minimize(makespan)
             # AM3 - TEMPORANEAMENTE COMMENTATO per debug poer vedere se il problema della non solzuione è il tempo ristretto
-            # if "target_finish_minutes" in params:
-            #     model.Add(makespan <= int(params["target_finish_minutes"]))
+            if "target_finish_minutes" in params:
+                model.Add(makespan <= int(params["target_finish_minutes"]))
 
         elif objective_mode == "MINIMIZE_OPERATORS":
             operator_ids = {oper_id for _, oper_id in v.assignments}

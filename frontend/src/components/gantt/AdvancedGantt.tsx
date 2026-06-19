@@ -522,9 +522,9 @@ export default function AdvancedGantt({
                     const isCrit = entry.is_critical_path;
 
                     return (
-                      <Tooltip key={entry.id}>
-                        <TooltipTrigger asChild>
                           <div
+                            key={entry.id}
+                            title={`${entry.operation_description}\n${entry.operator_name}\n${new Date(entry.scheduled_start).toLocaleDateString("it-IT")} → ${new Date(entry.scheduled_end).toLocaleDateString("it-IT")}`}
                             style={{
                               position: "absolute",
                               left: bx,
@@ -561,13 +561,6 @@ export default function AdvancedGantt({
                               </span>
                             )}
                           </div>
-                        </TooltipTrigger>
-                        <TooltipContent side="top" style={{ fontSize: 11, maxWidth: 200 }}>
-                          <p style={{ fontWeight: 700 }}>{entry.operation_description}</p>
-                          <p>{entry.operator_name}</p>
-                          <p>{new Date(entry.scheduled_start).toLocaleDateString("it-IT")} → {new Date(entry.scheduled_end).toLocaleDateString("it-IT")}</p>
-                        </TooltipContent>
-                      </Tooltip>
                     );
                   })}
                 </div>

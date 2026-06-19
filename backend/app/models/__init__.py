@@ -10,6 +10,7 @@ from app.models.reference import ReferencePoint, ReferencePointPrecedence
 from app.models.routing import Operation, Routing
 from app.models.schedule import ScheduleEntry, ScheduleScenario
 from app.models.workcenter import SkillWorkcenterMapping, Workcenter
+from app.core.state_engine.models_audit import OperationStatusAudit  # noqa: F401
 
 __all__ = [
     "Base",
@@ -34,4 +35,5 @@ __all__ = [
     "DelayEvent",
     "AiSuggestion",
     "AiChatSession",
+    "OperationStatusAudit",
 ]

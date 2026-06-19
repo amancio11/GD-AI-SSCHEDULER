@@ -67,6 +67,7 @@ from app.api.routes.schedule import router as scenarios_router, schedule_router
 from app.api.routes.dag import router as dag_router
 from app.api.routes.gantt import router as gantt_router
 from app.api.routes.database import router as database_router
+from app.api.routes import operations as operations_router
 
 API_PREFIX = "/api"
 
@@ -104,6 +105,7 @@ app.include_router(dag_router, prefix="/api")
 
 app.include_router(gantt_router, prefix=API_PREFIX)
 app.include_router(database_router)
+app.include_router(operations_router.router, prefix="/api")
 
 @app.on_event("startup")
 async def on_startup() -> None:
