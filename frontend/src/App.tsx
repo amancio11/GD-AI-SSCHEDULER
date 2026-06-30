@@ -4,7 +4,7 @@ import Dashboard from './pages/Dashboard';
 import GanttView from './pages/GanttView';
 import BOMExplorer from './pages/BOMExplorer';
 import OperatorCalendar from './pages/OperatorCalendar';
-import ReferencePointConfig from './pages/ReferencePointConfig';
+import ResourceConfig from './pages/ResourceConfig';
 import ScenarioManager from './pages/ScenarioManager';
 import DelayManager from './pages/DelayManager';
 import MissingComponents from './pages/MissingComponents';
@@ -26,7 +26,7 @@ export default function App() {
           <Route path="/gantt" element={<GanttView />} />
           <Route path="/bom" element={<BOMExplorer />} />
           <Route path="/calendar" element={<OperatorCalendar />} />
-          <Route path="/reference-points" element={<ReferencePointConfig />} />
+          <Route path="/resources" element={<ResourceConfig />} />
           <Route path="/scenarios" element={<ScenarioManager />} />
           <Route path="/delays" element={<DelayManager />} />
           <Route path="/missing" element={<MissingComponents />} />

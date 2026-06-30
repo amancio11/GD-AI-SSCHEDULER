@@ -16,6 +16,7 @@ class ScheduleScenarioBase(BaseModel):
     description: str | None = None
     machine_order_id: uuid.UUID
     objective_mode: ObjectiveMode = ObjectiveMode.FINISH_BY_DATE
+    start_date: date | None = None
     target_finish_date: date | None = None
     resource_set_json: dict | None = None
     is_active: bool = False
@@ -32,6 +33,7 @@ class ScheduleScenarioUpdate(BaseModel):
     description: str | None = None
     machine_order_id: uuid.UUID | None = None
     objective_mode: ObjectiveMode | None = None
+    start_date: date | None = None
     target_finish_date: date | None = None
     resource_set_json: dict | None = None
     is_active: bool | None = None
@@ -43,23 +45,12 @@ class ScheduleScenarioRead(ScheduleScenarioBase):
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
     created_at: datetime
-    # Risultato ultimo run CP-SAT
     last_run_status: str | None = None
     last_run_at: datetime | None = None
     last_run_makespan_days: float | None = None
     last_run_operators_used: int | None = None
     last_run_conflicts: list | None = None
-
-
-class ScheduleScenarioRead(ScheduleScenarioBase):
-    model_config = ConfigDict(from_attributes=True)
-    id: uuid.UUID
-    created_at: datetime
-    last_run_status: str | None = None
-    last_run_at: datetime | None = None
-    last_run_makespan_days: float | None = None
-    last_run_operators_used: int | None = None
-    last_run_conflicts: list | None = None
+    last_run_summary: dict | None = None
 
 # ── ScheduleEntry ─────────────────────────────────────────────────────────────
 

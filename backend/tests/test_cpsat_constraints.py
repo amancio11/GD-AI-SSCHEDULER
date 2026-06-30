@@ -100,29 +100,29 @@ def test_assignment_at_least_one():
     assert len(op_entries) >= 1
 
 
-def test_simultaneous_reduces_duration():
-    """With 2 operators and horizon=60, an op of 120 min is feasible via SIMULTANEOUS.
+def test_no_phantom_parallelism():
+    """An operation is worked by one operator at a time (sequential hand-off).
 
-    Single-operator path: duration = 120 > 60 → INFEASIBLE.
-    Two-operator path: duration = floor(120 / 2) = 60 ≤ 60 → OPTIMAL.
+    Two operators do NOT halve the duration: a 120-min op still needs 120
+    wall-clock minutes, so horizon=60 is INFEASIBLE; horizon=120 is feasible.
     """
     wc = uuid.uuid4()
     op = make_op(OperationType.MECHANICAL, wc, duration=120)
     oper1 = make_oper(SkillType.MECHANICAL, wc)
     oper2 = make_oper(SkillType.MECHANICAL, wc)
 
-    # Single operator cannot fit within horizon=60
-    sol_single = make_builder([op], [oper1], horizon=60).build_and_solve(
+    # Two operators cannot compress 120 min of work into 60 wall-clock minutes.
+    sol_tight = make_builder([op], [oper1, oper2], horizon=60).build_and_solve(
         "FINISH_BY_DATE", {}
     )
-    assert sol_single.status == "INFEASIBLE"
+    assert sol_tight.status == "INFEASIBLE"
 
-    # Two operators — SIMULTANEOUS reduces effective duration to 60
-    sol_two = make_builder([op], [oper1, oper2], horizon=60).build_and_solve(
+    # With enough horizon it is feasible and the makespan equals the work.
+    sol_ok = make_builder([op], [oper1, oper2], horizon=120).build_and_solve(
         "FINISH_BY_DATE", {}
     )
-    assert sol_two.status in ("OPTIMAL", "FEASIBLE")
-    assert sol_two.makespan_minutes == 60
+    assert sol_ok.status in ("OPTIMAL", "FEASIBLE")
+    assert sol_ok.makespan_minutes == 120
 
 
 def test_operator_nooverlap():
@@ -278,23 +278,32 @@ def test_minimize_operators_optimal_is_one():
     assert sol.operators_used == 1
 
 
-def test_simultaneous_two_operators_halves_duration():
-    """Verify that two simultaneous operators halve the effective duration.
+def test_handoff_across_operators_and_shifts():
+    """A long op is started by one operator and finished by another in a later shift.
 
-    Op: 120 min, 2 mechanical operators, horizon=60.
-    Expected: makespan = 60 (floor(120/2)).
+    Op needs 400 min.  Operator A is available only in the morning slot (225 min),
+    operator B only in the afternoon slot (225 min).  The op must be split into two
+    segments belonging to two different operators, preserving total work.
     """
     wc = uuid.uuid4()
-    op = make_op(OperationType.MECHANICAL, wc, duration=120)
-    oper1 = make_oper(SkillType.MECHANICAL, wc)
-    oper2 = make_oper(SkillType.MECHANICAL, wc)
+    op = make_op(OperationType.MECHANICAL, wc, duration=400)
+    oper_a = make_oper(SkillType.MECHANICAL, wc, slots=[(0, 225)])
+    oper_b = make_oper(SkillType.MECHANICAL, wc, slots=[(300, 525)])
 
-    sol = make_builder([op], [oper1, oper2], horizon=60).build_and_solve(
+    sol = make_builder([op], [oper_a, oper_b], horizon=5000).build_and_solve(
         "FINISH_BY_DATE", {}
     )
 
     assert sol.status in ("OPTIMAL", "FEASIBLE")
-    assert sol.makespan_minutes == 60
+    entries = [e for e in sol.schedule_entries if e.operation_id == op.id]
+    assert len(entries) == 2, "atteso hand-off in due segmenti"
+    assert len({e.operator_id for e in entries}) == 2, "due operatori distinti"
+    total = sum(e2 - s2 for s2, e2 in (start_end_minutes(e) for e in entries))
+    assert total == 400, f"lavoro totale {total} != 400"
+    # Each segment stays inside its operator's shift slot.
+    for e in entries:
+        s, en = start_end_minutes(e)
+        assert (0 <= s and en <= 225) or (300 <= s and en <= 525)
 
 
 def test_maximize_resource_utilization():

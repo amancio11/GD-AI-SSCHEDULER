@@ -1,0 +1,134 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# GD Scheduler — deploy con Podman (alternativa al deploy locale a più terminali)
+#
+#   podman compose -f podman-compose.yml up -d --build      # avvia tutto
+#   podman compose -f podman-compose.yml --profile seed run --rm seed
+#   podman compose -f podman-compose.yml logs -f backend worker
+#   podman compose -f podman-compose.yml down               # ferma (dati persistono)
+#   podman compose -f podman-compose.yml down -v            # ferma + cancella il DB
+#
+# Funziona anche con `docker compose -f podman-compose.yml ...` (stesso file).
+# Vedi GUIDA_TECNICA.md §17 per i prerequisiti e i dettagli rootless/SELinux.
+#
+# Note Podman:
+#  * I bind-mount usano l'opzione :Z (relabel SELinux) necessaria con podman
+#    machine / host SELinux. Docker la ignora silenziosamente: il file resta
+#    compatibile con entrambi.
+#  * `depends_on: condition:` richiede `podman compose` (provider docker-compose)
+#    oppure podman-compose >= 1.1.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: scheduler
+      POSTGRES_DB: scheduler
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler -d scheduler"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: docker.io/library/redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: applica le migrazioni Alembic, poi esce. Backend e worker
+  # attendono il suo completamento con successo.
+  migrate:
+    build: ./backend
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app:Z
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scheduler:scheduler@postgres:5432/scheduler
+    restart: "no"
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./backend:/app:Z
+    env_file:
+      - .env
+    environment:
+      # Override degli URL: dentro la rete compose i servizi si raggiungono per nome
+      # (le URL "localhost" del .env valgono solo per il deploy locale a terminali).
+      DATABASE_URL: postgresql+asyncpg://scheduler:scheduler@postgres:5432/scheduler
+      REDIS_URL: redis://redis:6379/0
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+  # Celery worker — esegue il reschedule (reschedule_incremental.delay) e l'AI proattiva.
+  # MANCAVA nel vecchio docker-compose.yml: senza, la rischedulazione non parte.
+  worker:
+    build: ./backend
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./backend:/app:Z
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scheduler:scheduler@postgres:5432/scheduler
+      REDIS_URL: redis://redis:6379/0
+    command: ["celery", "-A", "celery_worker.celery_app", "worker", "--pool=solo", "--loglevel=info"]
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app:Z
+      - /app/node_modules          # volume anonimo: preserva i node_modules del container
+    environment:
+      VITE_API_URL: http://localhost:8000
+      VITE_WS_URL: ws://localhost:8000
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5173"]
+
+  # Seed dei dati mock (TURBOPRESS-X500). OPT-IN: non parte con `up`, va invocato a mano.
+  #   podman compose -f podman-compose.yml --profile seed run --rm seed
+  seed:
+    build: ./backend
+    profiles: ["seed"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./backend:/app:Z
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scheduler:scheduler@postgres:5432/scheduler
+    command: ["python", "-m", "app.db.seed"]
+    restart: "no"
+
+volumes:
+  postgres_data:

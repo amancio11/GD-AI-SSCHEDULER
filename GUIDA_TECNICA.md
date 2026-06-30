@@ -4,6 +4,37 @@
 
 ---
 
+## ⚠️ AGGIORNAMENTO 2026-06-26 — Motore di scheduling: da CP-SAT a capacità di gruppo
+
+Il motore di scheduling è stato **riscritto**. Il vecchio modello CP-SAT a segmenti
+(un intervallo opzionale per ogni coppia *operatore × slot di calendario*, con `Σ size == durata` +
+due `NoOverlap`) si è rivelato **intrattabile**: su 240+ operazioni il solver non trovava nemmeno una
+soluzione fattibile in 60s (UNKNOWN), per via della simmetria degli operatori identici e del NoOverlap
+sui segmenti.
+
+**Nuovo modello (attuale) — CP-SAT cumulativo a capacità di gruppo:**
+- **`backend/app/core/scheduler/capacity_cpsat.py`** — motore CP-SAT cumulativo a minuti. Ogni operazione
+  → pochi segmenti opzionali (`Σ size == durata`, `NoOverlap` per-op = una risorsa alla volta); ogni
+  gruppo → **`AddCumulative`** con capacità = `count`; calendario via intervalli bloccanti; obiettivo
+  `Minimize(makespan)` / `makespan ≤ target`. Risorse = tipi `(workcenter, skill, ore/giorno, count)`,
+  non individui → niente simmetria, niente NoOverlap per-operatore.
+- **`backend/app/core/scheduler/capacity_scheduler.py`** — euristica greedy *di supporto*: gira prima per
+  dare **orizzonte stretto + warm-start** al CP-SAT, e fa da **fallback** se il solver va in timeout.
+- Il vecchio `cpsat_model_builder.py` (segmenti per-operatore) **non è più il motore**.
+- **Risorse = tipi configurabili**, non individui: tabella **`resource_types`**
+  `(workcenter_id, skill, daily_capacity_hours, count)`. Capacità di gruppo = `count × ore/giorno`
+  (due risorse 8h → 16h/giorno). API CRUD: `/api/resource-types`.
+- **Una risorsa alla volta per operazione** (max ore/giorno = capacità di una singola risorsa); le op
+  lunghe si spalmano su più giorni o passano a un'altra risorsa (hand-off).
+- **`schedule_entries.operator_id` è nullable**; aggiunto **`resource_type_id`**. Il Gantt raggruppa
+  per gruppo risorsa (workcenter · skill), non per nome operatore.
+- Orizzonte **slegato** dal calendario (solo bound anti-loop). Precedenze BOM (parent-wait + RP order)
+  **invariate**.
+
+Le sezioni CP-SAT/segmenti più sotto sono **storiche** e vanno lette in quest'ottica.
+
+---
+
 ## 1. DOMINIO
 
 Sistema di **Production Scheduling** per il montaggio di macchine industriali complesse (mock: TURBOPRESS-X500). Si integra in modo mock con SAP DM / SAP ERP.
@@ -116,8 +147,12 @@ shifts                  id, name, start_time, end_time, break_duration_minutes, 
 operator_calendar       id, operator_id FK, date, shift_id FK nullable, is_available, notes, override_reason
 missing_components      id, production_order_id FK, component_material, description,
                         expected_arrival_date, is_arrived, arrival_confirmed_date, manually_flagged, notes
-schedule_scenarios      id, machine_order_id FK, name, objective_mode, target_finish_date,
-                        resource_set_json, is_active, is_baseline, ai_explanation, created_at
+schedule_scenarios      id, machine_order_id FK, name, objective_mode,
+                        start_date DATE nullable,           ← NUOVA (migration 005): data di partenza scheduling
+                        target_finish_date DATE nullable,   vincolo hard FINISH_BY_DATE
+                        resource_set_json, is_active, is_baseline, ai_explanation,
+                        last_run_status, last_run_at, last_run_makespan_days,
+                        last_run_operators_used, last_run_conflicts, created_at
 schedule_entries        id, scenario_id FK, operation_id FK, operator_id FK, workcenter_id FK,
                         scheduled_start, scheduled_end, actual_start, actual_end,
                         status ENUM(SCHEDULED|IN_PROGRESS|COMPLETED|INTERRUPTED|DELAYED|STALE),
@@ -134,6 +169,8 @@ operation_status_audit  id, entity_type, entity_id, old_status, new_status, is_u
 ```
 
 **Enum `targetlevel`**: migration `001` lo crea con `MACROAGGREGATE, AGGREGATE`. Migration `002` aggiunge `GROUP` (`ALTER TYPE targetlevel ADD VALUE IF NOT EXISTS 'GROUP'`).
+
+**Campo `start_date`** (migration `005`): data di partenza dello scheduling per ogni scenario. Se `NULL`, il `reschedule_engine` usa `date.today()` come fallback. Questo è il punto zero dell'epoch CP-SAT — tutte le variabili di tempo sono minuti relativi a questo instante.
 
 ---
 
@@ -192,12 +229,12 @@ GUA-200   "Guarnizione gomma"     → oggi +5gg
 
 ```
 backend/app/core/scheduler/
-  cpsat_types.py            SchedulableOperation, QualifiedOperator, CpsatVariables, CpsatSolution
-  cpsat_model_builder.py    CpsatModelBuilder con build_and_solve()
+  cpsat_types.py            SchedulableOperation, QualifiedOperator, SegmentVars, CpsatVariables, CpsatSolution
+  cpsat_model_builder.py    CpsatModelBuilder con build_and_solve() — modello a segmenti (v2)
   dag_builder.py            build_precedence_dag(), get_scheduling_order()
   shift_preprocessor.py     build_operator_available_slots(), build_unavailable_intervals()
   reschedule_engine.py      Celery task reschedule_incremental (ENTRY POINT)
-  solution_extractor.py     Traduce soluzione CP-SAT in schedule_entries
+  solution_extractor.py     LEGACY/non usato — l'estrazione è in CpsatModelBuilder._extract_entries()
   infeasibility_analyzer.py Spiega INFEASIBLE in italiano
 
 backend/app/core/state_engine/    ← NUOVO (vedi sezione 9)
@@ -220,123 +257,130 @@ backend/app/core/ai/
 
 ## 6. CP-SAT — STATO REALE DEI VINCOLI E DELL'OBIETTIVO
 
-> Questa sezione è stata riverificata riga per riga contro il codice attuale
-> (giugno 2026). Le versioni precedenti di questo documento contenevano
-> affermazioni superate (es. "obiettivo disabilitato") che NON sono più vere.
-> Vedi sezione 6.4 per il dettaglio di cosa è cambiato.
+> Questa sezione descrive il **modello a segmenti (v2)** introdotto per rendere il
+> calendario degli operatori un vincolo hard e per consentire l'**hand-off** di
+> un'operazione tra operatori e turni. Il documento di riferimento dettagliato è
+> `SCHEDULER_CONSTRAINTS.md`. Vedi 6.4b per cosa è cambiato rispetto alla v1.
 
 ### 6.1 Riepilogo vincoli CP-SAT
 
 | # | Vincolo | Metodo | Stato |
 |---|---|---|---|
-| 1 | Ogni op ha esattamente 1 operatore qualificato (WC + skill) | `_add_assignment_constraints()` | ✅ Implementato |
-| 2 | Operatori senza slot esclusi dall'assegnazione | `_add_shift_nooverlap_constraints()` | ⚠️ **v1 rilassata** (vedi 6.2) |
-| 3 | Un operatore non fa due op contemporaneamente | `_add_operator_nooverlap_constraints()` | ✅ Implementato |
-| 4 | Precedenze dirette op→op (`precedence_pairs`) | `_add_precedence_constraints()` | ✅ Implementato (pairs attualmente vuoti — routing SIMULTANEOUS non ne genera) |
-| 5 | **Tipo B**: ordinamento intra-livello via DAG RP | `_add_rp_order_constraints()` | ✅ Implementato |
-| 6 | **Tipo A**: op padre aspetta figlio target (per ogni RP) | `_add_parent_wait_constraints()` | ✅ **Implementato** (era il problema #1 ad alta priorità — risolto) |
-| 7 | Op bloccata finché componente mancante non arriva | `_add_missing_component_constraints()` | ✅ Implementato |
+| 1 | Tutto il lavoro di un'op è allocato sui segmenti (`Σ size == residual`); può distribuirsi su più operatori/turni | `_create_variables()` | ✅ Implementato |
+| 2 | Ogni segmento vive dentro il suo slot-turno (calendario = vincolo **hard**) | `_create_variables()` (domini) | ✅ Implementato |
+| 3 | Un operatore non fa due segmenti contemporaneamente | `_add_resource_nooverlap_constraints()` | ✅ Implementato |
+| 4 | Un'operazione è lavorata da un solo operatore alla volta (hand-off sequenziale) | `_add_resource_nooverlap_constraints()` | ✅ Implementato |
+| 5 | Precedenze dirette op→op (`precedence_pairs`) | `_add_precedence_constraints()` | ✅ Implementato |
+| 6 | **Tipo B**: ordinamento intra-livello via DAG RP | `_add_rp_order_constraints()` | ✅ Implementato |
+| 7 | **Tipo A**: op padre aspetta figlio target (per ogni RP) | `_add_parent_wait_constraints()` | ✅ Implementato |
+| 8 | Op bloccata finché componente mancante non arriva | `_add_missing_component_constraints()` | ✅ Implementato |
 
-### 6.2 Vincolo turni — ancora v1 rilassata (NON risolto)
+### 6.2 Vincolo turni — RISOLTO con la decomposizione a segmenti
 
-`_add_shift_nooverlap_constraints()` blocca **solo** gli operatori che non hanno
-nessuno slot disponibile in tutto l'horizon. Non impedisce a un'operazione di
-cadere a cavallo di un periodo di assenza o fuori turno.
+Il calendario è ora un vincolo **strutturale**. Ogni operazione è decomposta in
+*segmenti* (uno per slot-turno candidato); ogni segmento ha `start, end ∈
+[slot_start, slot_end]` per costruzione, quindi nessun lavoro può cadere in pausa,
+fuori turno o in un giorno di assenza. Non esiste più il "forward pass" post-solve:
+`op_end` è la fine wall-clock esatta.
 
 ```python
-def _add_shift_nooverlap_constraints(self) -> None:
-    for oper in self.operators:
-        if not oper.available_slots:
-            for (op_id, oper_id), bv in v.assignments.items():
-                if oper_id == oper.id:
-                    model.Add(bv == 0)
+# Cuore del modello (per ogni op):
+Σ size[seg] == work_residual                  # tutto il lavoro svolto
+seg.start, seg.end ∈ [slot_start, slot_end]   # turni = hard
+seg.present ⇒ size ≥ 1 ; ¬present ⇒ size = 0
+op_start = min present seg.start ; op_end = max present seg.end
 ```
 
-**Perché è così**: la versione completa (`AddNoOverlap(fixed_intervals + optional)`)
-causa INFEASIBLE in 0.2s perché operazioni multi-turno (es. 480 min) non
-entrano in un singolo slot (max ~225 min per turno con pausa). La fix corretta
-richiede la **decomposizione slot-task**: spezzare ogni operazione lunga in N
-sotto-task che stanno singolarmente dentro un turno. **Non ancora implementata.**
+**Hand-off tra operatori/turni.** I segmenti di una stessa operazione possono
+appartenere a operatori diversi e turni diversi: una lavorazione lunga può essere
+**iniziata da un operatore in un turno e completata da un altro in un turno
+successivo**. Il no-overlap per-operazione garantisce che l'hand-off sia
+*sequenziale* (niente parallelismo fantasma che dimezzerebbe la durata).
 
-**NON ripristinare** il vecchio `AddNoOverlap(fixed + optional)` senza prima
-implementare la decomposizione slot-task — causa lo stesso crash.
+**Quando si spezza un'operazione (in parole semplici).** La segmentazione **non è
+decisa a priori: la decide il solver**. In fase di build creo solo segmenti
+*potenziali* (una casella per ogni operatore-qualificato × slot); il solver accende
+quelli che servono per soddisfare `Σ size == durata`. Quindi:
+- se il lavoro entra in **un'unica finestra continua → un solo segmento** (nessuno
+  spezzettamento);
+- l'op si spezza **solo se non ci sta**: il turno finisce (fine turno/pausa/assenza)
+  prima del completamento e il resto trabocca nello slot successivo, eventualmente di
+  un altro operatore. Es.: 400 min con A (mattina, 225) e B (pomeriggio, 225) → 225 su
+  A + 175 su B; ma 200 min → tutto su A, intero.
 
-### 6.3 Obiettivo CP-SAT — IMPLEMENTATO, non più disabilitato
+Vedi anche `SCHEDULER_CONSTRAINTS.md` §3c (quando si spezza) e §13.1 (frammentazione
+estetica delle op non critiche).
 
-`_set_objective()` implementa tutti e 4 i modi (`objective_mode`), non è più `pass`:
+**Operazione non schedulabile.** Se un'op non ha alcuno slot candidato (nessun
+operatore qualificato/disponibile), il modello aggiunge un vincolo contraddittorio
+→ scenario `INFEASIBLE` con messaggio in `conflicts`.
+
+**Pruning** (`_candidate_slots` + `_compute_est`): per ogni op si tengono solo gli
+slot più vicini la cui capacità cumulata raggiunge `SLOT_CAPACITY_FACTOR ×
+work_residual` (default 4×, env `CPSAT_SLOT_CAPACITY_FACTOR`), a partire da un lower
+bound `est[op]` ottenuto col longest-path sul DAG delle dipendenze.
+
+### 6.3 No-overlap risorse — `_add_resource_nooverlap_constraints()`
+
+Due famiglie di `AddNoOverlap` sugli `interval` dei segmenti:
+
+```python
+# per operatore: 1 segmento alla volta
+AddNoOverlap([seg.interval for seg in segmenti_di(operatore)])
+
+# per operazione: 1 operatore alla volta (hand-off sequenziale)
+AddNoOverlap([seg.interval for seg in segmenti(op)])
+```
+
+### 6.4 Obiettivo CP-SAT — `_set_objective()`
 
 ```python
 FINISH_BY_DATE:
-    makespan = model.NewIntVar(0, horizon, "makespan")
-    model.AddMaxEquality(makespan, list(op_end.values()))
-    model.Minimize(makespan)
-    # ⚠️ vedi nota sotto: il vincolo hard sul target è commentato
+    makespan = max(op_end);  Minimize(makespan)
+    if "target_finish_minutes" in params:
+        model.Add(makespan <= target_finish_minutes)   # vincolo hard attivo
 
 MINIMIZE_OPERATORS:
-    # minimizza sum(operator_used_bool) — un bool per operatore, AddMaxEquality
-    # sulle sue assign vars
+    # minimizza sum(operator_used_bool); used = OR(assign[*, oper])
 
 MAXIMIZE_RESOURCE_UTILIZATION:
-    # massimizza sum(assign[op,oper] * durata[op])
+    # mappato su minimize makespan (l'utilizzo è costante: Σ size == residual)
 
 CUSTOM:
-    # somma pesata: w_makespan*makespan + w_operators*used - w_utilization*total_util
-    # pesi da params["weights"], default {makespan:0.5, operators:0.3, utilization:0.2}
+    # w_makespan*makespan + w_operators*operatori ; default {makespan:0.6, operators:0.4}
 ```
 
-Il parametro solver è stato corretto coerentemente: `stop_after_first_solution`
-non è più sempre `True`. La logica attuale in `build_and_solve`:
+`assign[(op, oper)] = OR(present)` dei segmenti dell'operatore su quell'op (reificato
+con `AddMaxEquality`), usato solo dagli obiettivi che contano gli operatori.
 
-```python
-has_objective = self.model.Proto().HasField("objective") or \
-                self.model.Proto().HasField("floating_point_objective")
+Logica `stop_after_first_solution` in `build_and_solve` invariata: `False` se c'è un
+obiettivo (il solver ottimizza davvero), `True` solo per pura soddisfacibilità.
 
-if has_objective:
-    self.solver.parameters.stop_after_first_solution = False
-    if objective_mode in ("MINIMIZE_OPERATORS", "MAXIMIZE_RESOURCE_UTILIZATION", "CUSTOM"):
-        self.solver.parameters.max_time_in_seconds = max(self.TIMEOUT, 60)
-else:
-    self.solver.parameters.stop_after_first_solution = True
-```
+**Vincolo hard `target_finish_minutes` attivo**: il solver rifiuta soluzioni che
+sforano la `target_finish_date`; se impossibile → `INFEASIBLE`.
 
-→ **con un obiettivo attivo, il solver ha tempo per ottimizzare davvero**, non
-si ferma più alla prima soluzione fattibile come avveniva nella versione
-originaria del progetto.
+### 6.4b Cosa è cambiato rispetto alla v1 (modello a singolo operatore)
 
-**⚠️ Punto ancora aperto — vincolo hard su `target_finish_minutes` commentato:**
-
-```python
-if objective_mode == "FINISH_BY_DATE":
-    makespan = model.NewIntVar(0, self.horizon, "makespan")
-    model.AddMaxEquality(makespan, list(v.op_end.values()))
-    model.Minimize(makespan)
-    # AM3 - TEMPORANEAMENTE COMMENTATO per debug
-    # if "target_finish_minutes" in params:
-    #     model.Add(makespan <= int(params["target_finish_minutes"]))
-```
-
-Conseguenza pratica: oggi il solver **minimizza** il makespan (cerca di finire
-il prima possibile dato lo stato corrente), ma **non rifiuta** una soluzione
-che sfora la `target_finish_date` dello scenario — quel vincolo rigido è
-disattivato per debug e non è stato riattivato. Verificare lo stato di questo
-commento prima di assumere che le date target siano garantite come hard
-constraint.
-
-### 6.4 Cosa è cambiato rispetto alle versioni precedenti di questo documento
-
-| Affermazione vecchia (superata) | Stato reale verificato |
+| v1 (superata) | v2 (attuale) |
 |---|---|
-| "`_add_parent_wait_constraints()` DA AGGIUNGERE — problema #1 priorità ALTA" | ✅ Implementato e integrato in `build_and_solve` |
-| "`_set_objective` è `pass` (solo soddisfacibilità)" | ❌ Falso oggi — tutti e 4 i modi sono implementati |
-| "Il solver usa `stop_after_first_solution=True`" sempre | ❌ Falso oggi — `True` solo in assenza di obiettivo |
-| "Vincolo turni rilassato v1" | ✅ Ancora vero — non ancora risolto |
+| `assign==1`: esattamente 1 operatore per op | `Σ size == residual`: lavoro distribuibile su più operatori/turni (hand-off) |
+| Durata wall-clock **stimata** (`wc_span` da `ref_start` fisso) | `op_end` **esatto** (max degli end dei segmenti) |
+| Turni rispettati da `_slot_aware_forward_pass()` post-solve | Turni = vincolo **hard** nei domini dei segmenti |
+| `_add_solution_hints()` greedy pre-solve | Rimosso (non più necessario) |
+| `_compute_wall_clock_span`, `_compute_slot_aware_end`, forward pass | **Eliminati** |
+| 1 `ScheduleEntry` per operazione | 1 `ScheduleEntry` **per segmento** (Gantt mostra l'hand-off) |
 
 ### 6.5 Decisioni critiche — NON modificare senza capire il perché
 
-**Assegnazione 1 operatore, durata fissa.** Rimossa la logica SIMULTANEOUS multi-operatore
-(`AddDivisionEquality` è non-lineare → instabile). Attualmente: `sum(assign_vars) == 1`,
-durata fissa = residual da `max(planned × (1 - progress/100), MIN_OP_DURATION)`.
-**NON reintrodurre** `AddDivisionEquality` senza testare su subset di 10 op con `CPSAT_MAX_OPS=10`.
+**No parallelismo fantasma.** Il no-overlap per-operazione (§6.3) impedisce che due
+operatori lavorino la stessa op nello stesso istante: l'hand-off è *sequenziale*, la
+durata non si dimezza. Se in futuro serve la lavorazione SIMULTANEA (più operatori in
+parallelo su una stessa op), va modellata esplicitamente rilassando questo vincolo —
+**non** è un effetto collaterale gratuito.
+
+**Pruning vs. INFEASIBLE spurio.** Se su istanze molto cariche il solver torna
+`INFEASIBLE` per contesa risorse, alzare `CPSAT_SLOT_CAPACITY_FACTOR` (più slot
+candidati per op) prima di sospettare un bug del modello.
 
 **Workcenter ID nelle operazioni:**
 ```python
@@ -404,18 +448,26 @@ paralleli dello stesso livello.
 ```
 1.  Carica scenario e machine_order (sessione sync — Celery non supporta asyncio nativo)
 2.  Marca tutte le schedule_entries esistenti del scenario come STALE
-3.  Identifica operazioni IN_PROGRESS → i loro end sono trattati come vincolo fisso
+3.  Identifica operazioni IN_PROGRESS (actual_start set, actual_end NULL) →
+    le loro op_id vengono raccolte in `in_progress_op_ids`
 4.  Carica operazioni schedulabili (status != COMPLETED)
-4a. Calcola vincoli componenti mancanti
-4b. Carica operatori + slot calendario (56 giorni da oggi)
-4c. Costruisce il DAG dei reference point (dag_builder, networkx)
-4d. Calcola rp_order_constraints (Tipo B) + parent_wait_constraints (Tipo A)
-5.  Calcola horizon (min tra target_finish_date e fine calendario + 7gg)
+4a. Calcola epoch = scenario.start_date (o date.today() se NULL)
+    Calcola now_minutes = minuti tra epoch e UTC ora
+    Costruisce schedulable_ops:
+      - ops IN_PROGRESS → earliest_start_minutes = now_minutes  ← NUOVO
+      - ops PENDING/BLOCKED → earliest_start_minutes = 0
+4b. Calcola vincoli componenti mancanti (arrival_date → minuto CP-SAT)
+4c. Carica operatori + slot calendario dal giorno `start_date` in poi
+4d. Costruisce il DAG dei reference point; calcola:
+    - rp_order_constraints (Tipo B: ordine tra rami fratelli)
+    - parent_wait_constraints (Tipo A: padre aspetta figlio)
+5.  Calcola horizon = min(target_finish_date, fine_calendario + 7gg)
 6.  Costruisce e risolve il modello CP-SAT (cpsat_model_builder)
-7.  Se FEASIBLE/OPTIMAL: persiste le nuove schedule_entries (solution_extractor),
-    elimina le STALE
-8.  Notifica il frontend via WebSocket {"type": "RESCHEDULE_COMPLETE", "scenario_id": ...}
-9.  Avvia analisi proattiva AI in background (analyze_proactive task)
+7.  Se FEASIBLE/OPTIMAL: persiste nuove schedule_entries, elimina STALE
+8.  Aggiorna scenario: last_run_status, last_run_at, last_run_makespan_days,
+    last_run_operators_used, last_run_conflicts
+9.  Notifica frontend via WebSocket {"type": "RESCHEDULE_COMPLETE", ...}
+10. Avvia analisi proattiva AI in background (analyze_proactive task)
 ```
 
 Tre eventi triggerano oggi una rischedulazione automatica:
@@ -428,11 +480,17 @@ Tre eventi triggerano oggi una rischedulazione automatica:
 
 ## 8. SOLUTION EXTRACTOR E INFEASIBILITY ANALYZER
 
-`solution_extractor.py`:
+> **Nota v2:** l'estrazione delle entries avviene in
+> `CpsatModelBuilder._extract_entries()` (1 `ScheduleEntryCreate` **per segmento
+> presente**). `solution_extractor.py` è **legacy/non collegato** al flusso attuale;
+> i suoi helper (`compute_makespan`, `find_critical_path`) restano utilizzabili come
+> utility ma `extract()` riflette ancora il vecchio modello a singolo operatore.
+
+`solution_extractor.py` (legacy):
 
 | Metodo | Descrizione |
 |---|---|
-| `extract(solver, vars, ops, epoch, scenario_id)` | Legge `solver.Value(op_start/op_end)`, trova `assign==1`, converte minuti→datetime, ritorna `list[ScheduleEntryCreate]` |
+| `extract(solver, vars, ops, epoch, scenario_id)` | Legacy: 1 entry per `assign==1` con `op_start/op_end` aggregati. Non usato dal flusso a segmenti. |
 | `compute_makespan(entries)` | `max(end) − min(start)` → `timedelta` |
 | `compute_operator_utilization(entries, total_available_minutes)` | `{op_id: min(1.0, worked/available)}` per ogni operatore |
 | `find_critical_path(entries, precedence_pairs)` | Longest-path su DAG pesato (peso = durata predecessore), `nx.dag_longest_path` |
@@ -508,7 +566,7 @@ DELAY_RESCHEDULE_THRESHOLD_MINUTES=15   # .env
   impatto sullo schedule esistente).
 
 Il reschedule innescato dal state engine usa lo stesso `objective_mode` dello
-scenario attivo (sezione 6.3) — se lo scenario ha `FINISH_BY_DATE`, il nuovo
+scenario attivo (sezione 6.4) — se lo scenario ha `FINISH_BY_DATE`, il nuovo
 piano post-ritardo minimizza di nuovo il makespan, non produce una soluzione
 arbitraria.
 
@@ -589,7 +647,67 @@ repo). Vedi `INTEGRAZIONE.md` per i diff puntuali:
 
 ---
 
-## 10. AI LAYER — 7 modalità
+## 10. SCENARIO — start_date, FINISH_BY_DATE e reschedule robusto (NUOVO)
+
+### 10.1 Data di partenza configurabile (`start_date`)
+
+Ogni scenario ha un campo opzionale `start_date`. È il **punto zero dell'epoch CP-SAT**:
+tutte le variabili di tempo nel modello OR-Tools sono minuti interi relativi a questo instante.
+
+```
+epoch = datetime(start_date.year, start_date.month, start_date.day, 0, 0, 0, UTC)
+```
+
+Se `start_date` è `NULL`, il reschedule usa `date.today()` (comportamento precedente).
+
+**Casi d'uso:**
+- `start_date = oggi` → scheduling standard in tempo reale
+- `start_date = data futura` → simulazione "se iniziassimo il 1° agosto…"
+- `start_date = data passata` → ricostruzione storica / confronto retroattivo
+
+Il frontend (`NewScenarioModal`) espone il campo per tutti gli obiettivi di scheduling.
+Il calendario degli operatori viene caricato **dal giorno `start_date`** in poi, non da oggi.
+
+### 10.2 FINISH_BY_DATE — vincolo hard attivo
+
+Il vincolo `makespan <= target_finish_minutes` è **attivo** in CP-SAT.
+Se i vincoli di precedenza, i componenti mancanti o la capacità degli operatori
+rendono impossibile rispettare la data, il solver restituisce `INFEASIBLE`.
+
+Il frontend segnala questo con il banner rosso "Soluzione non fattibile" e
+suggerisce azioni correttive (allargare la finestra, rimuovere componenti mancanti,
+aggiungere operatori al workcenter).
+
+`target_finish_minutes` viene calcolato in `reschedule_engine` come:
+```python
+target_dt = datetime(target_finish_date.year, ..., 23, 59, UTC)
+params["target_finish_minutes"] = datetime_to_minutes(target_dt, epoch)
+```
+
+Nota: l'horizon CP-SAT è comunque limitato al min tra `target_finish_date` e
+la fine del calendario degli operatori + 7 giorni. Se `target_finish_date` supera
+il calendario, l'horizon viene troncato con un warning di log.
+
+### 10.3 Reschedule robusto — operazioni IN_PROGRESS
+
+Al momento del reschedule, le operazioni con `actual_start` impostato e `actual_end`
+ancora `NULL` (cioè in corso) vengono identificate in **Step 3**.
+
+Il loro `earliest_start_minutes` viene impostato a `now_minutes` (minuti tra epoch e UTC ora),
+non a `0`. Questo garantisce che il solver **non riposizioni nel passato** un'operazione
+già avviata. La durata residua è già corretta tramite `progress_pct`.
+
+```python
+earliest = now_minutes if op.id in in_progress_op_ids else 0
+```
+
+Se `start_date` è nel futuro, `now_minutes` è negativo → viene clampato a `0`
+(nessuna operazione può iniziare prima dell'epoch, cioè prima di `start_date`).
+
+---
+
+## 11. AI LAYER — 7 modalità
+
 
 | Modalità | Trigger | Endpoint |
 |---|---|---|
@@ -633,7 +751,7 @@ ad ogni chiamata (Claude non ha memoria propria tra chiamate API separate).
 
 ---
 
-## 11. WEBSOCKET
+## 12. WEBSOCKET
 
 Notifiche real-time al frontend (`ConnectionManager`, endpoint `GET /ws/{room_id}`,
 room = `machine_order_id` o `scenario_id`):
@@ -645,11 +763,14 @@ room = `machine_order_id` o `scenario_id`):
 
 ---
 
-## 12. MIGRATIONS ALEMBIC
+## 13. MIGRATIONS ALEMBIC
 
 - `001_initial_schema.py` — tutte le 19 tabelle originarie, enum `targetlevel` con `MACROAGGREGATE, AGGREGATE`
 - `002_add_group_to_targetlevel.py` — `ALTER TYPE targetlevel ADD VALUE IF NOT EXISTS 'GROUP'`
-- `003_add_operation_status_audit.py` — tabella `operation_status_audit` (state engine, sezione 9)
+- `003_add_cascade_to_scenario_id_fkey.py` — `CASCADE` su FK `schedule_entries.scenario_id`
+- `004_add_operation_status_audit.py` — tabella `operation_status_audit` (state engine, sezione 9)
+- `005_add_start_date_to_scenario.py` — colonna `start_date DATE nullable` su `schedule_scenarios`
+  — punto zero dell'epoch CP-SAT per ogni scenario; se NULL usa `date.today()`
 
 Alembic usa psycopg2 sync. `env.py` converte `postgresql+asyncpg://` → `postgresql+psycopg2://`.
 
@@ -658,7 +779,7 @@ Comando corretto: dalla cartella `backend` con venv attivo e PostgreSQL portable
 
 ---
 
-## 13. PARAMETRI SOLVER ATTUALI
+## 14. PARAMETRI SOLVER ATTUALI
 
 ```python
 solver.parameters.max_time_in_seconds = 30           # 60 se MINIMIZE_OPERATORS/MAXIMIZE_UTIL/CUSTOM
@@ -668,55 +789,150 @@ solver.parameters.log_search_progress = True          # solo dev
 solver.parameters.linearization_level = 1
 ```
 
-Hint greedy attivo (`_add_solution_hints`): assegna ogni op al primo operatore
-disponibile in ordine topologico prima del solve vero — riduce il tempo a
-FEASIBLE da ~30s a 1-5s anche con obiettivo attivo.
+`CPSAT_SLOT_CAPACITY_FACTOR = 4.0` (env): per ogni op si generano i segmenti solo sui
+slot più vicini la cui capacità cumulata raggiunge `4 × work_residual`. Alzarlo se il
+solver torna `INFEASIBLE` per contesa risorse su istanze cariche.
+
+> L'hint greedy pre-solve (`_add_solution_hints`) è stato **rimosso** nella v2 insieme
+> al forward pass: il modello a segmenti non ne ha bisogno. Se i tempi di solve
+> crescono su istanze grandi, valutare un hint sui `present`/`size` dei segmenti.
 
 ---
 
-## 14. ERRORI NOTI E SOLUZIONI
+## 15. ERRORI NOTI E SOLUZIONI
 
 | Errore | Causa | Soluzione |
 |---|---|---|
 | `'GROUP' is not among the defined enum values` | Migration 002 non applicata | `python -m alembic upgrade head` |
+| `column "start_date" of relation … does not exist` | Migration 005 non applicata | `python -m alembic upgrade head` |
 | `connection refused port 5432` | PostgreSQL portable non avviato | Avviare con `pg_ctl start -D <data_dir>` |
 | `alembic upgrade head` fallisce su localhost | Eseguito fuori dal venv con PG spento | Attivare venv + avviare PG + rieseguire |
-| `AddDivisionEquality` → INFEASIBLE | Durata variabile non lineare | Usare durata fissa + 1 solo operatore |
-| `AddNoOverlap(fixed + optional)` → INFEASIBLE | Op 480min non entra nei turni | Vincolo turni rilassato (v1 attuale, sezione 6.2) |
+| `AddDivisionEquality` → INFEASIBLE | Durata variabile non lineare | Usare durata fissa (residual) |
+| Op 480min non entra in un turno (~225min) | Modello v1 a singolo intervallo | Risolto — decomposizione a segmenti (sezione 6.2), l'op si spezza su più turni/operatori |
+| `INFEASIBLE` per contesa risorse su istanze cariche | Pochi slot candidati per op | Alzare `CPSAT_SLOT_CAPACITY_FACTOR` |
 | `wc_id = routing.production_order_id` | Bug UUID ordine usato come WC | Fix: `wc_id = op.workcenter_id or po.workcenter_id` |
 | `ModuleNotFoundError: celery_worker` | Celery lanciato da cartella sbagliata | `cd backend` prima di lanciare Celery |
 | Tutte le op schedulabili in parallelo (ignorano BOM) | `parent_wait_constraints` mancanti | Risolto — vedi sezione 6.1/6.4 |
-| `MINIMIZE_OPERATORS` e `MAXIMIZE_RESOURCE_UTILIZATION` danno risultati identici | `stop_after_first_solution=True` ignorava l'obiettivo | Risolto — vedi sezione 6.3 |
-| Makespan supera `target_finish_date` senza errore | Vincolo hard `makespan <= target_finish_minutes` commentato per debug | Ancora aperto — vedi sezione 6.3 |
+| `MINIMIZE_OPERATORS` e `MAXIMIZE_RESOURCE_UTILIZATION` danno risultati identici | `stop_after_first_solution=True` ignorava l'obiettivo | Risolto — vedi sezione 6.4 |
+| Op IN_PROGRESS rischedulata nel passato | `earliest_start_minutes=0` ignorava lo stato | Risolto — ora ancorata a `now_minutes` |
 | `PATCH /api/operations/{id}/status` → 404 Not Found | Router `operations.py` non esisteva | Risolto — vedi sezione 9, da integrare in `main.py` |
 
 ---
 
-## 15. PROBLEMI APERTI (ordinati per priorità, stato verificato giugno 2026)
+## 16. PROBLEMI APERTI (ordinati per priorità, stato verificato giugno 2026)
 
-### 1. Vincolo hard `target_finish_minutes` commentato (ALTA)
+### 1. Contiguità dei segmenti / anti-frammentazione (BASSA)
 
-In `_set_objective`, ramo `FINISH_BY_DATE`, la riga
-`model.Add(makespan <= int(params["target_finish_minutes"]))` è commentata
-"temporaneamente per debug". Il solver minimizza il makespan ma non rifiuta
-soluzioni che sforano la data target. Verificare se riattivarla rompe la
-feasibility con i dati di seed attuali prima di farlo in modo permanente.
+Il modello a segmenti (sezione 6.2) rispetta i turni come vincolo hard, ma **non**
+impone che gli slot interni siano riempiti prima di passare al successivo: le
+operazioni non critiche potrebbero risultare frammentate. L'obiettivo makespan tende
+a compattare, ma per un Gantt più pulito si può aggiungere la formulazione monotona
+`before/after` (vedi `SCHEDULER_CONSTRAINTS.md` §13).
 
-### 2. Vincolo turni v2 — decomposizione slot-task (MEDIA)
-
-`_add_shift_nooverlap_constraints()` resta in versione v1 rilassata (sezione
-6.2). Le operazioni possono essere schedulate a cavallo di periodi di assenza
-o fuori turno. Richiede di spezzare ogni operazione lunga in sotto-task che
-stiano singolarmente dentro un turno.
-
-### 3. Validazione end-to-end del nuovo state engine (MEDIA)
+### 2. Validazione end-to-end del nuovo state engine (MEDIA)
 
 `order_status_rollup.py`, `delay_propagation.py` e il router `operations.py`
 (sezione 9) sono stati validati solo a livello di logica pura. Vanno
 testati contro un Postgres reale e integrati fisicamente nel repo
 (`INTEGRAZIONE.md`).
 
-### 4. `AddDivisionEquality` / multi-operatore SIMULTANEOUS (BASSA)
+### 3. Lavorazione SIMULTANEA (più operatori in parallelo su una stessa op) (BASSA)
 
-Resta disabilitato per instabilità del solver. Non reintrodurre senza un
-banco di prova isolato (`CPSAT_MAX_OPS=10`).
+Il modello v2 supporta l'**hand-off sequenziale** (operatori diversi in tempi diversi),
+ma **non** la lavorazione simultanea che dimezzerebbe la durata. Richiede di rilassare
+il no-overlap per-operazione (sezione 6.5) modellando esplicitamente la capacità
+parallela. Non introdurla come effetto collaterale.
+
+---
+
+## 17. DEPLOY CON PODMAN (alternativa al deploy locale a terminali)
+
+Oltre al deploy locale a più terminali (`start-local.ps1`, con Postgres/Redis
+portable), lo stack si può avviare interamente in container con **Podman**, senza
+Docker e senza privilegi di amministratore (Podman è rootless e daemonless).
+
+### 17.1 File coinvolti
+
+| File | Ruolo |
+|------|-------|
+| `podman-compose.yml` | Definizione dei 7 servizi (vedi sotto). Funziona anche con `docker compose`. |
+| `start-podman.ps1` | Script PowerShell: verifica Podman, avvia la macchina, build + up, seed opzionale. |
+| `backend/Dockerfile` | Immagine backend (FastAPI + Celery + OR-Tools). Usata da `backend`, `worker`, `migrate`, `seed`. |
+| `frontend/Dockerfile` | Immagine frontend (Vite dev server). |
+| `backend/.dockerignore`, `frontend/.dockerignore` | Escludono `.venv`/`node_modules`/cache dal build context (rispettati anche da Podman). |
+
+### 17.2 Servizi
+
+| Servizio | Cosa fa | Porta |
+|----------|---------|-------|
+| `postgres` | PostgreSQL 16 (volume `postgres_data`, healthcheck `pg_isready`) | 5432 |
+| `redis` | Redis 7 (broker/backend Celery, healthcheck `redis-cli ping`) | 6379 |
+| `migrate` | One-shot: `alembic upgrade head`, poi esce. Backend/worker lo attendono. | — |
+| `backend` | `uvicorn app.main:app --reload` | 8000 |
+| `worker` | `celery -A celery_worker.celery_app worker --pool=solo` — **esegue il reschedule** | — |
+| `frontend` | `npm run dev` (Vite) | 5173 |
+| `seed` | Opt-in (profile `seed`): popola i dati mock TURBOPRESS-X500 | — |
+
+> Il vecchio `docker-compose.yml` era **incompleto**: mancava il servizio `worker`
+> (senza il quale `reschedule_incremental.delay` non viene mai eseguito) e lo step di
+> migrazione. `podman-compose.yml` li include entrambi.
+
+### 17.3 Prerequisiti (una-tantum)
+
+1. Installare **Podman Desktop** (include `podman` CLI e il provider `podman compose`).
+2. Su Windows/macOS inizializzare la macchina Podman:
+   ```powershell
+   podman machine init
+   podman machine start
+   ```
+3. Tenere il progetto **sotto la home utente** (es. `C:\Users\<nome>\...`): la podman
+   machine monta automaticamente la home, e i bind-mount del codice (hot-reload)
+   funzionano solo per path montati.
+
+### 17.4 Avvio
+
+```powershell
+# Tutto in un comando (build immagini + avvio + healthcheck):
+.\start-podman.ps1            # avvia lo stack
+.\start-podman.ps1 -Seed      # avvia E popola i dati mock (primo avvio)
+.\start-podman.ps1 -Down      # ferma (il DB nel volume resta)
+```
+
+Oppure manualmente:
+```powershell
+podman compose -f podman-compose.yml up -d --build
+podman compose -f podman-compose.yml --profile seed run --rm seed   # seed opt-in
+podman compose -f podman-compose.yml logs -f backend worker
+podman compose -f podman-compose.yml down                           # stop
+podman compose -f podman-compose.yml down -v                        # stop + cancella DB
+```
+
+Frontend → `http://localhost:5173`, backend/docs → `http://localhost:8000/docs`.
+
+### 17.5 Note tecniche specifiche per Podman
+
+- **Override degli URL**: il `.env` contiene URL `@localhost` (validi per il deploy a
+  terminali). Dentro la rete compose i servizi si raggiungono per **nome**, quindi il
+  compose sovrascrive `DATABASE_URL`/`REDIS_URL` con `@postgres`/`@redis` (la chiave
+  `environment` ha precedenza su `env_file`).
+- **SELinux / `:Z`**: i bind-mount usano l'opzione `:Z` (relabel) richiesta dalla
+  podman machine; Docker la ignora, quindi lo stesso file resta compatibile.
+- **`node_modules`**: il servizio `frontend` usa un volume anonimo su `/app/node_modules`
+  così i moduli installati nel container non vengono nascosti dal bind-mount del sorgente.
+- **`psycopg2-binary`**: aggiunto a `requirements.txt` — Alembic (`alembic/env.py`) usa
+  il driver **sync** psycopg2, distinto dall'asyncpg usato a runtime da FastAPI. Senza,
+  lo step `migrate` fallirebbe nel container.
+- **`depends_on: condition:`**: `service_healthy` / `service_completed_successfully`
+  richiedono `podman compose` (provider docker-compose) o `podman-compose >= 1.1`.
+- **Hot-reload**: backend (`--reload`) e frontend (Vite) montano il sorgente dall'host,
+  quindi le modifiche al codice si ricaricano a caldo come nel deploy locale.
+
+### 17.6 Troubleshooting
+
+| Problema | Causa / Soluzione |
+|----------|-------------------|
+| `migrate` fallisce con errore psycopg2 | Ricostruire l'immagine: `podman compose -f podman-compose.yml build --no-cache backend` (deve includere `psycopg2-binary`). |
+| Backend non raggiunge il DB | URL ancora `@localhost`: verifica che il compose imposti `DATABASE_URL=...@postgres`. |
+| Bind-mount vuoto / codice non montato | Progetto fuori dalla home montata: spostalo sotto `C:\Users\<nome>` o aggiungi il volume con `podman machine init --volume`. |
+| `condition` ignorata / ordine errato | Stai usando una versione vecchia di `podman-compose`: passa a `podman compose`. |
+| Reschedule non parte | Controlla che il servizio `worker` sia up: `podman compose -f podman-compose.yml ps`. |

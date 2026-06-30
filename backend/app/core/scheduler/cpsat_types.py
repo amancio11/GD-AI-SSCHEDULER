@@ -50,20 +50,46 @@ class QualifiedOperator:
 
 
 @dataclass
+class SegmentVars:
+    """One work *segment* of an operation inside a single operator shift-slot.
+
+    An operation is decomposed into N optional segments (one per candidate
+    operator-slot).  Different segments of the same operation may belong to
+    *different* operators and *different* shifts: this is what allows a long
+    operation to be started by one operator in one shift and finished by another
+    operator in a later shift (calendar-preemption / hand-off).
+
+    The segment is "present" only if it carries work (``size > 0``).  When
+    present, ``start``/``end`` are pinned inside ``[slot_start, slot_end]`` so the
+    operator's shift calendar becomes a *hard* CP-SAT constraint — no post-solve
+    correction is needed.
+    """
+
+    operator_id: uuid.UUID
+    slot_start: int                # shift-slot lower bound (epoch minutes)
+    slot_end: int                  # shift-slot upper bound (epoch minutes)
+    present: BoolVar               # 1 ⟺ this segment carries work
+    start: IntVar                  # work start inside the slot
+    size: IntVar                   # work minutes done in this slot (0 if absent)
+    end: IntVar                    # = start + size
+    interval: IntervalVar          # optional interval, for NoOverlap
+
+
+@dataclass
 class CpsatVariables:
     """Container for all CP-SAT decision variables created for one model instance."""
 
-    # Per-operation variables
-    op_start: dict[uuid.UUID, IntVar]                    # op_id → start IntVar
-    op_end:   dict[uuid.UUID, IntVar]                    # op_id → end IntVar
-    op_interval: dict[uuid.UUID, IntervalVar]            # op_id → interval (may be replaced in 6b)
-    op_duration: dict[uuid.UUID, int]                    # op_id → residual duration (integer)
+    # Per-operation aggregate variables
+    op_start: dict[uuid.UUID, IntVar]                    # op_id → first segment start (min)
+    op_end:   dict[uuid.UUID, IntVar]                    # op_id → last segment end (max)
+    op_duration: dict[uuid.UUID, int]                    # op_id → residual work duration
 
-    # Assignment variables: (op_id, operator_id) → BoolVar
+    # Reified "operator o does part of op" — (op_id, operator_id) → BoolVar.
+    # Equals OR of the operator's segment-present vars; used by objectives.
     assignments: dict[tuple[uuid.UUID, uuid.UUID], BoolVar]
 
-    # Optional intervals per (op_id, operator_id) — used for NoOverlap constraints
-    operator_optional_intervals: dict[tuple[uuid.UUID, uuid.UUID], IntervalVar]
+    # Per-operation work segments (the core of the model).
+    segments: dict[uuid.UUID, list[SegmentVars]] = field(default_factory=dict)
 
 
 @dataclass

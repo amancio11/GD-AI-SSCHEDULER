@@ -23,9 +23,37 @@ from app.models.missing import MissingComponent
 from app.models.operator import Operator
 from app.models.production import ProductionOrder
 from app.models.reference import ReferencePoint, ReferencePointPrecedence
+from app.models.resource import ResourceType
 from app.models.routing import Operation, Routing
 from app.models.schedule import ScheduleEntry, ScheduleScenario
 from app.models.workcenter import Workcenter
+
+
+def _resource_label(rt: ResourceType | None, wc: Workcenter | None) -> tuple[str, str, str]:
+    """(id_str, label, skill) per una entry a capacità di gruppo.
+
+    Riusa le chiavi 'operator_*' del payload: il frontend raggruppa/colora per
+    questo identificativo → diventa il *gruppo risorsa* invece dell'operatore.
+    """
+    if rt is None:
+        wc_code = wc.code if wc else "—"
+        return ("—", f"{wc_code} · n/d", "—")
+    skill = rt.skill.value if hasattr(rt.skill, "value") else str(rt.skill)
+    wc_code = (rt.workcenter.code if rt.workcenter else None) or (wc.code if wc else "")
+    label = rt.name or (f"{wc_code} · {skill}" if wc_code else skill)
+    return (str(rt.id), label, skill)
+
+
+async def _load_resource_types(db: AsyncSession, entries: list[ScheduleEntry]) -> dict[UUID, ResourceType]:
+    rt_ids = {e.resource_type_id for e in entries if e.resource_type_id}
+    if not rt_ids:
+        return {}
+    res = await db.execute(
+        select(ResourceType)
+        .where(ResourceType.id.in_(rt_ids))
+        .options(selectinload(ResourceType.workcenter))
+    )
+    return {rt.id: rt for rt in res.scalars().all()}
 
 router = APIRouter(prefix="/gantt", tags=["gantt"])
 
@@ -62,6 +90,8 @@ async def get_enriched_gantt(
     if not entries:
         return {"entries": [], "dependencies": [], "rp_markers": []}
 
+    rt_map = await _load_resource_types(db, entries)
+
     # 3) Mancanti per ordine (per badge sul Gantt)
     missing_q = select(MissingComponent).where(
         MissingComponent.is_arrived.is_(False)
@@ -79,7 +109,7 @@ async def get_enriched_gantt(
         op = e.operation
         po = op.routing.production_order
         wc = op.workcenter or po.workcenter
-        operator = e.operator
+        res_id, res_label, res_skill = _resource_label(rt_map.get(e.resource_type_id), wc)
         entries_payload.append(
             {
                 "id": str(e.id),
@@ -88,11 +118,12 @@ async def get_enriched_gantt(
                 "operation_type": op.operation_type.value
                 if hasattr(op.operation_type, "value")
                 else str(op.operation_type),
-                "operator_id": str(operator.id),
-                "operator_name": operator.full_name,
-                "operator_skill": operator.skill.value
-                if hasattr(operator.skill, "value")
-                else str(operator.skill),
+                # Chiavi 'operator_*' = gruppo risorsa (capacità), non più individuo
+                "operator_id": res_id,
+                "operator_name": res_label,
+                "operator_skill": res_skill,
+                "resource_type_id": res_id,
+                "resource_label": res_label,
                 "workcenter_id": str(wc.id),
                 "workcenter_code": wc.code,
                 "workcenter_name": wc.name,
@@ -303,22 +334,24 @@ async def get_operations_flat(
  
     if not entries:
         return []
- 
+
+    rt_map = await _load_resource_types(db, entries)
+
     # 3) Serializza in formato ScheduledOp atteso dal frontend
     result: list[dict[str, Any]] = []
     for e in entries:
         op       = e.operation
         po       = op.routing.production_order
-        operator = e.operator
-        wc       = operator.workcenter if operator else None
- 
-        # Workcenter code: preferisce quello dell'operatore, fallback al PO
+        wc       = op.workcenter or po.workcenter
+        _rid, res_label, res_skill = _resource_label(rt_map.get(e.resource_type_id), wc)
+
+        # Workcenter code: workcenter dell'operazione, fallback al PO
         wc_code = (wc.code if wc else None) or (po.workcenter.code if po.workcenter else "—")
- 
+
         # Helper per serializzare enum (str o .value)
         def ev(x: Any) -> str:
             return x.value if hasattr(x, "value") else str(x)
- 
+
         result.append({
             # Identificatori
             "entry_id":   str(e.id),
@@ -328,9 +361,9 @@ async def get_operations_flat(
             "operation_description": op.description or f"Op {op.sequence_number}",
             "operation_type": ev(op.operation_type),
  
-            # Operatore
-            "operator_name": operator.full_name if operator else "—",
-            "operator_skill": ev(operator.skill) if operator else "—",
+            # Gruppo risorsa (capacità) — niente più operatore con nome
+            "operator_name": res_label,
+            "operator_skill": res_skill,
  
             # Workcenter
             "workcenter_code": wc_code,

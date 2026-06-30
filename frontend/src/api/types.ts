@@ -195,18 +195,56 @@ export interface MissingComponent {
   notes: string | null;
 }
 
+export interface WorkcenterBreakdown {
+  workcenter_id: string;
+  ops_count: number;
+  operators_available: number;
+}
+
+export interface ScheduleRunSummary {
+  schedule_start_date: string;
+  horizon_date: string;
+  objective_mode: string;
+  triggered_by: string;
+  total_schedulable_ops: number;
+  total_work_minutes: number;
+  total_capacity_minutes: number;
+  operators_total: number;
+  operators_with_slots: number;
+  workcenter_breakdown: WorkcenterBreakdown[];
+  in_progress_anchored: number;
+  missing_constraints_active: number;
+  rp_order_constraints_count: number;
+  parent_wait_constraints_count: number;
+  orphan_ops_count: number;
+  impossible_ops_count: number;
+  engine_used: 'greedy' | 'cpsat';
+  solver_status: string;
+  solve_time_seconds: number | null;
+  scheduled_ops: number;
+  operators_used: number | null;
+  makespan_days: number | null;
+  earliest_start: string | null;
+  latest_end: string | null;
+  conflicts: string[];
+}
+
 export interface ScheduleScenario {
   id: UUID;
   name: string;
   description: string | null;
   machine_order_id: UUID;
   objective_mode: ObjectiveMode;
+  start_date: string | null;
   target_finish_date: string | null;
   resource_set_json: Record<string, unknown> | null;
   is_active: boolean;
   is_baseline: boolean;
   ai_explanation: string | null;
   last_run_status?: 'OPTIMAL' | 'FEASIBLE' | 'INFEASIBLE' | null;
+  last_run_makespan_days?: number | null;
+  last_run_operators_used?: number | null;
+  last_run_summary?: ScheduleRunSummary | null;
   created_at: ISODatetime;
 }
 

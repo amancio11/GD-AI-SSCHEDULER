@@ -44,6 +44,13 @@ _DATABASE_URL: str = os.environ["DATABASE_URL"].replace(
 TODAY: date = date.today()
 NOW: datetime = datetime.now(timezone.utc)
 
+# Quanti giorni di calendario operatori generare a partire da TODAY.
+# L'orizzonte CP-SAT è max_cal_date + 7; con catene di precedenze profonde
+# (RP order + parent-wait) il critical path può superare le ~4 settimane, quindi
+# servono abbastanza giorni perché ogni operazione trovi uno slot prima della fine
+# del calendario (altrimenti reschedule → INFEASIBLE).
+CALENDAR_DAYS: int = int(os.getenv("SEED_CALENDAR_DAYS", "90"))
+
 # ─── Pre-computed IDs ────────────────────────────────────────────────────────
 WC_IDS: dict[str, uuid.UUID] = {
     "WC-MILANO":  sid("wc:WC-MILANO"),
@@ -299,6 +306,30 @@ async def seed_operators(conn: asyncpg.Connection) -> None:
         INSERT INTO operators (id, employee_id, full_name, skill, workcenter_id, is_active)
         VALUES ($1, $2, $3, $4, $5, $6)
         ON CONFLICT (employee_id) DO NOTHING
+        """,
+        rows,
+    )
+
+
+async def seed_resource_types(conn: asyncpg.Connection) -> None:
+    """Config risorse a capacità: un tipo per ogni gruppo (workcenter, skill),
+    `count` = numero di operatori di quel gruppo, 8h/giorno ciascuno.
+    Deriva i numeri dagli operatori seed; lo scheduler usa SOLO questi tipi."""
+    from collections import Counter
+    groups: Counter[tuple[str, str]] = Counter()
+    for _emp_id, _name, skill, wc in OP_DEFS:
+        groups[(wc, skill)] += 1
+
+    rows = [
+        (sid(f"restype:{wc}:{skill}"), f"{wc} {skill}", WC_IDS[wc], skill, 8.0, count, True)
+        for (wc, skill), count in sorted(groups.items())
+    ]
+    await conn.executemany(
+        """
+        INSERT INTO resource_types
+            (id, name, workcenter_id, skill, daily_capacity_hours, count, is_active)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (workcenter_id, skill) DO NOTHING
         """,
         rows,
     )
@@ -892,7 +923,7 @@ async def seed_missing_components(conn: asyncpg.Connection) -> None:
 
 
 async def seed_operator_calendar(conn: asyncpg.Connection) -> None:
-    """Generate 28-day calendar for all operators with ~8 random absences."""
+    """Generate a CALENDAR_DAYS-day calendar for all operators with ~8 random absences."""
     shifts_cycle = ["Mattina", "Pomeriggio", "Notte"]
     rows: list[tuple] = []
     absences: set[tuple[str, date]] = set()
@@ -901,11 +932,11 @@ async def seed_operator_calendar(conn: asyncpg.Connection) -> None:
     op_ids_list = [e[0] for e in OP_DEFS]
     for _ in range(8):
         emp = random.choice(op_ids_list)
-        day_offset = random.randint(0, 27)
+        day_offset = random.randint(0, CALENDAR_DAYS - 1)
         absences.add((emp, TODAY + timedelta(days=day_offset)))
 
     for emp_id, _, _, _ in OP_DEFS:
-        for day_offset in range(28):
+        for day_offset in range(CALENDAR_DAYS):
             cal_date = TODAY + timedelta(days=day_offset)
             is_absent = (emp_id, cal_date) in absences
             shift_name = shifts_cycle[day_offset % 3]
@@ -984,6 +1015,7 @@ async def main() -> None:
         await seed_shifts(conn)
         await seed_skill_workcenter_mapping(conn)
         await seed_operators(conn)
+        await seed_resource_types(conn)
         await seed_machine_order(conn)
         await seed_bom(conn)
         await seed_z_orders_link(conn)

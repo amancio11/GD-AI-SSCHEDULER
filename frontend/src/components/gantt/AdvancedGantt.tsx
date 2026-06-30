@@ -26,12 +26,7 @@
 //   quindi non possono mai disallinearsi — il browser garantisce altezze uguali.
 
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { X } from "lucide-react";
 
 // ============================================================================
@@ -286,7 +281,7 @@ function EntryPopup({ entry, x, y, onClose }: { entry: GanttEntry; x: number; y:
         <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "#94a3b8", padding: 2 }}><X size={14} /></button>
       </div>
       <dl style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "4px 10px", color: "#475569", margin: 0 }}>
-        {[["Operatore", entry.operator_name], ["Workcenter", `${entry.workcenter_code} — ${entry.workcenter_name}`], ["Start", fmt(entry.scheduled_start)], ["End", fmt(entry.scheduled_end)], ["Progresso", `${entry.progress_pct}%`], ["Stato", entry.status]].map(([k, v]) => (
+        {[["Risorsa", entry.operator_name], ["Workcenter", `${entry.workcenter_code} — ${entry.workcenter_name}`], ["Start", fmt(entry.scheduled_start)], ["End", fmt(entry.scheduled_end)], ["Progresso", `${entry.progress_pct}%`], ["Stato", entry.status]].map(([k, v]) => (
           <>
             <dt key={`k${k}`} style={{ fontWeight: 600, whiteSpace: "nowrap" }}>{k}</dt>
             <dd key={`v${k}`} style={{ margin: 0 }}>{v}</dd>
@@ -384,7 +379,7 @@ export default function AdvancedGantt({
         <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", borderBottom: "1px solid #e2e8f0", background: "#f8fafc", flexShrink: 0, flexWrap: "wrap" }}>
           {(["BY_OPERATOR", "BY_WORKCENTER", "BY_ORDER"] as GroupingMode[]).map((m) => (
             <button key={m} onClick={() => setMode(m)} style={{ padding: "4px 10px", fontSize: 12, border: "1px solid #e2e8f0", borderRadius: 6, cursor: "pointer", background: mode === m ? "#1e40af" : "transparent", color: mode === m ? "#fff" : "#475569", fontWeight: mode === m ? 700 : 400 }}>
-              {m === "BY_OPERATOR" ? "Operatori" : m === "BY_WORKCENTER" ? "Workcenter" : "Ordini BOM"}
+              {m === "BY_OPERATOR" ? "Risorse" : m === "BY_WORKCENTER" ? "Workcenter" : "Ordini BOM"}
             </button>
           ))}
           <div style={{ width: 1, height: 20, background: "#e2e8f0" }} />
@@ -437,7 +432,7 @@ export default function AdvancedGantt({
                 display: "flex", alignItems: "center", paddingLeft: 10,
               }}>
                 <span style={{ fontSize: 10, color: "#94a3b8", fontWeight: 600, letterSpacing: "0.05em", textTransform: "uppercase" }}>
-                  {mode === "BY_OPERATOR" ? "Operatore" : mode === "BY_WORKCENTER" ? "Workcenter" : "Ordine BOM"}
+                  {mode === "BY_OPERATOR" ? "Risorsa" : mode === "BY_WORKCENTER" ? "Workcenter" : "Ordine BOM"}
                 </span>
               </div>
 

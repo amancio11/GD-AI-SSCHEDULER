@@ -1,0 +1,6 @@
+# Build context exclusions (rispettato sia da podman build sia da docker build)
+node_modules/
+dist/
+.vite/
+*.log
+.env

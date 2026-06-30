@@ -1,0 +1,12 @@
+# Build context exclusions (rispettato sia da podman build sia da docker build)
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dump.rdb
+.env
+*.md

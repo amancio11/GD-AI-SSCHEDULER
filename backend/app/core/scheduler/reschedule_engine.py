@@ -192,18 +192,24 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
         .values(status=ScheduleEntryStatus.STALE)
     )
 
-    # ── Step 3: Identify IN_PROGRESS operations (keep their end time) ─────────
+    # ── Step 3: Identify IN_PROGRESS operations (anchor their earliest start) ──
+    # Before marking STALE, collect entries whose actual_start is set but not
+    # actual_end — these were running when the reschedule was triggered.
+    # We pin their earliest_start to "now" so the solver does not schedule them
+    # in the past. Their residual duration is already encoded in progress_pct.
+    in_progress_op_ids: set[uuid.UUID] = set()
     in_progress_entries = (
         session.query(ScheduleEntry)
         .filter(
             ScheduleEntry.scenario_id == scenario_id,
             ScheduleEntry.status == ScheduleEntryStatus.STALE,
-            # actual_start set = was in progress before marking STALE
+            ScheduleEntry.actual_start.isnot(None),
+            ScheduleEntry.actual_end.is_(None),
         )
         .all()
     )
-    blocking_from_in_progress: dict[uuid.UUID, int] = {}  # op_id → earliest_start_min
-    # (Not blocking anything in the stub; full logic implemented once models stabilise)
+    for entry in in_progress_entries:
+        in_progress_op_ids.add(entry.operation_id)
 
     # ── Step 4: Load schedulable operations ──────────────────────────────────
     ops_rows = (
@@ -218,43 +224,66 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
     )
 
     from app.core.scheduler.cpsat_types import QualifiedOperator, SchedulableOperation
+    from app.core.scheduler.shift_preprocessor import compute_epoch, datetime_to_minutes
     from app.enums import OperationType
+
+    # Epoch = data di partenza dello scenario (o oggi come fallback).
+    # Tutte le variabili CP-SAT sono minuti relativi a questo istante.
+    schedule_start_date: date = (
+        date.fromisoformat(str(scenario.start_date))
+        if scenario.start_date
+        else date.today()
+    )
+    today = schedule_start_date
+    epoch = compute_epoch(schedule_start_date)
+
+    # "Ora" in minuti CP-SAT — usata per ancorare le operazioni IN_PROGRESS.
+    now_minutes = datetime_to_minutes(datetime.now(timezone.utc), epoch)
+    # Non può essere negativo (se start_date è nel futuro, "ora" non esiste ancora).
+    now_minutes = max(now_minutes, 0)
 
     schedulable_ops: list[SchedulableOperation] = []
     for op, routing, po in ops_rows:
         # Priorità: workcenter sull'operazione → workcenter sull'ordine → skip
         wc_id = op.workcenter_id or po.workcenter_id
         if wc_id is None:
-            logger.warning(
-                "Operazione %s senza workcenter_id — saltata", op.id
-            )
+            logger.warning("Operazione %s senza workcenter_id — saltata", op.id)
             continue
+        # Le operazioni IN_PROGRESS non possono essere riposizionate nel passato:
+        # il loro earliest_start è "ora" (o 0 se lo scenario è futuro).
+        earliest = now_minutes if op.id in in_progress_op_ids else 0
         schedulable_ops.append(
             SchedulableOperation(
                 id=op.id,
                 routing_id=routing.id,
                 production_order_id=po.id,
                 operation_type=OperationType(op.operation_type.value),
-                workcenter_id=wc_id,  # ← fix
+                workcenter_id=wc_id,
                 planned_duration_minutes=op.planned_duration_minutes,
                 progress_pct=op.progress_pct,
                 can_be_interrupted=op.can_be_interrupted,
-                earliest_start_minutes=0,
+                earliest_start_minutes=earliest,
                 reference_point_id=op.reference_point_id,
             )
         )
-
 
     if not schedulable_ops:
         logger.info("No schedulable operations for scenario %s — nothing to do", scenario_id)
         _cleanup_stale(session, scenario_id)
         return {"status": "SKIPPED", "reason": "no_schedulable_ops"}
 
-    # ── Step 4b: Missing component constraints ────────────────────────────────
-    from app.core.scheduler.shift_preprocessor import compute_epoch, datetime_to_minutes
+    logger.info(
+        "Scenario %s: start_date=%s, epoch=%s, %d IN_PROGRESS ops ancorati a now=%d min",
+        scenario_id, schedule_start_date, epoch, len(in_progress_op_ids), now_minutes,
+    )
 
-    today = date.today()
-    epoch = compute_epoch(today)
+    # ── Step 4b: NO vincolo intra-routing da sequence_number ─────────────────
+    # L'ordinamento delle operazioni deriva ESCLUSIVAMENTE dai Reference Point (RP DAG).
+    # Non esiste precedenza legata allo stepId/sequence_number delle operazioni.
+    # Le coppie hard (rp_direct_pairs) vengono costruite in Step 4d.
+    _sched_ids = {op.id for op in schedulable_ops}
+    # precedence_pairs sarà valorizzato da rp_direct_pairs in Step 4d
+    precedence_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
 
     missing_rows = (
         session.query(MissingComponent)
@@ -284,76 +313,66 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
                         missing_constraints.get(op_sc.id, 0), arrival_min
                     )
 
-    # ── Step 4c: Operators + availability slots ────────────────────────────────
-    from app.core.scheduler.shift_preprocessor import _shift_slots_for_day
+    # ── Step 4c: Gruppi risorse a capacità (workcenter + skill) ─────────────────
+    # Niente più operatori con nome né slot di calendario: lo scheduler usa SOLO i
+    # ResourceType configurati. count risorse × ore/giorno = capacità del gruppo.
+    from app.core.scheduler.capacity_scheduler import ResourceGroup
     from app.enums import SkillType
-    from app.models.operator import Shift
+    from app.models.resource import ResourceType
 
-    operators_rows = session.query(Operator).filter(Operator.is_active.is_(True)).all()
+    def _weekday_maps(rt: ResourceType) -> tuple[dict[int, int], dict[int, int]]:
+        """Costruisce (weekday_count, weekday_minutes) dal weekday_schedule del tipo
+        risorsa; se assente, default: lun–ven = (count, ore), sab/dom = 0."""
+        wc: dict[int, int] = {}
+        wm: dict[int, int] = {}
+        sched = rt.weekday_schedule or {}
+        base_min = int(round((rt.daily_capacity_hours or 0) * 60))
+        for wd in range(7):
+            entry = sched.get(str(wd))
+            if entry is not None:
+                wc[wd] = max(0, int(entry.get("count", 0) or 0))
+                wm[wd] = max(0, int(round(float(entry.get("hours", 0) or 0) * 60)))
+            elif wd < 5:
+                wc[wd] = max(0, rt.count)
+                wm[wd] = base_min
+            else:
+                wc[wd] = 0
+                wm[wd] = 0
+        return wc, wm
 
-    # Carica i turni in un dizionario per evitare lazy-loading nella sessione sync.
-    # Senza questo, cal.shift è None e nessun operatore ha slot disponibili.
-    all_shifts: dict[uuid.UUID, Shift] = {
-        s.id: s for s in session.query(Shift).all()
-    }
-
-    calendar_rows = (
-        session.query(OperatorCalendar)
-        .filter(
-            OperatorCalendar.operator_id.in_([o.id for o in operators_rows]),
-            OperatorCalendar.date >= today,
-        )
-        .all()
+    resource_type_rows = (
+        session.query(ResourceType).filter(ResourceType.is_active.is_(True)).all()
     )
-
-    # Build slots per operator
-    from collections import defaultdict
-    cal_by_op: dict[uuid.UUID, list] = defaultdict(list)
-    for cal in calendar_rows:
-        cal_by_op[cal.operator_id].append(cal)
-
-    qualified_operators: list[QualifiedOperator] = []
-    for oper in operators_rows:
-        slots: list[tuple[int, int]] = []
-        for cal in sorted(cal_by_op.get(oper.id, []), key=lambda c: c.date):
-            if not cal.is_available or cal.shift_id is None:
-                continue
-            shift = all_shifts.get(cal.shift_id)
-            if shift is None:
-                continue
-            day_slots = _shift_slots_for_day(
-                day=cal.date,
-                shift_start_time=shift.start_time,
-                shift_end_time=shift.end_time,
-                break_duration_minutes=shift.break_duration_minutes,
-                epoch=epoch,
-            )
-            slots.extend(day_slots)
-        qualified_operators.append(
-            QualifiedOperator(
-                id=oper.id,
-                skill=SkillType(oper.skill.value),
-                workcenter_id=oper.workcenter_id,
-                available_slots=slots,
+    resource_groups: list[ResourceGroup] = []
+    for rt in resource_type_rows:
+        wc_map, wm_map = _weekday_maps(rt)
+        if not any(wc_map[wd] > 0 and wm_map[wd] > 0 for wd in range(7)):
+            continue  # nessuna capacità in nessun giorno
+        resource_groups.append(
+            ResourceGroup(
+                workcenter_id=rt.workcenter_id,
+                skill=SkillType(rt.skill.value),
+                resource_type_id=rt.id,
+                weekday_count=wc_map,
+                weekday_minutes=wm_map,
             )
         )
 
-    total_slots = sum(len(q.available_slots) for q in qualified_operators)
-    operators_with_slots = sum(1 for q in qualified_operators if q.available_slots)
+    group_daily_capacity = sum(g.weekly_capacity_minutes for g in resource_groups)
     logger.info(
-        "Operators loaded: %d total, %d with slots, %d total slot windows",
-        len(qualified_operators), operators_with_slots, total_slots,
+        "Resource groups loaded: %d gruppi, capacità totale %d min/settimana",
+        len(resource_groups), group_daily_capacity,
     )
-
 
     # ── DIAGNOSI WORKCENTER ───────────────────────────────────────────────────
     from collections import Counter
     wc_counts = Counter(str(op.workcenter_id) for op in schedulable_ops)
     for wc_str, count in wc_counts.items():
-        opers_in_wc = [o for o in qualified_operators if str(o.workcenter_id) == wc_str]
+        groups_in_wc = [g for g in resource_groups if str(g.workcenter_id) == wc_str]
+        cap = sum(g.weekly_capacity_minutes for g in groups_in_wc)
         logger.info(
-            "WC %s: %d ops, %d operatori disponibili",
-            wc_str, count, len(opers_in_wc)
+            "WC %s: %d ops, %d gruppi risorse (%d min/giorno)",
+            wc_str, count, len(groups_in_wc), cap,
         )
 
     # ── Step 4d: Precedence constraints dal DAG dei Reference Point ───────────
@@ -383,8 +402,9 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
     machine_model_id = machine_order_row.machine_model_id if machine_order_row else None
  
     rp_order_constraints: list[tuple[list[uuid.UUID], list[uuid.UUID]]] = []
-    precedence_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []  # mantenuto vuoto (usiamo rp_order_constraints)
- 
+    parent_wait_constraints: list[tuple[list[uuid.UUID], uuid.UUID]] = []
+    # precedence_pairs già costruita in Step 4b (sequenza intra-routing)
+
     if machine_model_id is None:
         logger.warning("machine_model_id non trovato per machine_order %s — skip RP precedences", machine_order_id)
     else:
@@ -429,8 +449,36 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
         ops_by_order: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
         for op_sc in schedulable_ops:
             ops_by_order[op_sc.production_order_id].append(op_sc.id)
- 
-        # Per ogni arco pred_rp → succ_rp nel DAG, costruisce il vincolo
+
+        # ── rp_direct_pairs: vincoli HARD diretti tra op con reference_point_id ──
+        # Ogni operazione con reference_point_id è un'op di "integrazione/assemblaggio"
+        # che referenzia un nodo specifico del DAG RP. Per ogni arco RP_pred → RP_succ,
+        # l'op con RP_pred deve finire prima che l'op con RP_succ inizi.
+        # Questo è il vincolo hard che deriva ESCLUSIVAMENTE dal RP DAG.
+        #
+        # Bypass naturale con componenti mancanti:
+        # Le op foglia (GROUP) non hanno reference_point_id → nessun vincolo hard RP su di loro.
+        # Se un GROUP ha earliest_start alto (componente mancante), le altre op lavorano
+        # liberamente; solo l'op di integrazione (con reference_point_id) rispetta l'ordine RP.
+        rp_to_op_id: dict[uuid.UUID, uuid.UUID] = {}
+        for _op_r, _routing_r, _po_r in ops_rows:
+            if _op_r.id in schedulable_op_ids and _op_r.reference_point_id:
+                rp_to_op_id[_op_r.reference_point_id] = _op_r.id
+
+        rp_direct_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
+        for prec_d in prec_rows:
+            _pred_op = rp_to_op_id.get(prec_d.predecessor_reference_point_id)
+            _succ_op = rp_to_op_id.get(prec_d.reference_point_id)
+            if _pred_op and _succ_op:
+                rp_direct_pairs.append((_pred_op, _succ_op))
+
+        precedence_pairs[:] = rp_direct_pairs   # sovrascrive la lista vuota di Step 4b
+        logger.info(
+            "Step 4d: %d archi RP DAG → %d rp_direct_pairs (vincoli hard op diretti con RP)",
+            len(prec_rows), len(rp_direct_pairs),
+        )
+
+        # Per ogni arco pred_rp → succ_rp nel DAG, costruisce il vincolo subtree
         for prec in prec_rows:
             pred_rp_id = prec.predecessor_reference_point_id
             succ_rp_id = prec.reference_point_id
@@ -471,177 +519,323 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
             len(prec_rows), len(rp_order_constraints),
         )
 
-        # ── Tipo A: ogni op con RP deve aspettare il completamento del target ────────
-        # parent_wait_constraints: list[tuple[list[op_id], op_id]]
-        # = [(ops_del_target_ricorsivo, op_id_del_padre), ...]
-        parent_wait_constraints: list[tuple[list[uuid.UUID], uuid.UUID]] = []
-
-        for op_sc in schedulable_ops:
-            if op_sc.reference_point_id is None:
+        # ── Tipo A: vincolo BOM HARD (ordine-livello, ricorsivo) ─────────────────
+        # Semantica: TUTTE le op di un ordine padre devono aspettare che TUTTE le
+        # op di TUTTI i figli BOM (diretti e ricorsivi) siano completate prima di
+        # poter iniziare.
+        #
+        # Questo è un vincolo HARD: prima di lavorare un'operazione di un ordine,
+        # tutti gli ordini nella sua BOM devono essere completati.
+        #
+        # Il parallelismo tra sottoalberi (es. GRP-001..003 e GRP-004..007) è
+        # possibile perché non esiste alcun vincolo hard tra di loro: il vincolo
+        # BOM agisce solo tra padre e i SUOI figli (non tra figli di padri diversi).
+        #
+        # La priorità di quale sottoalbero lavorare prima è fornita dal DAG RP
+        # (rp_order_constraints → op_priority), che è SOFT e guida solo il
+        # dispatch del greedy e il warm-start del CP-SAT.
+        for order_id, child_ids in children_map.items():
+            if not child_ids:
                 continue
-            target_po_id = rp_id_to_po_id.get(op_sc.reference_point_id)
-            if target_po_id is None:
-                logger.debug("RP %s → nessun ordine target trovato per op %s", op_sc.reference_point_id, op_sc.id)
+            parent_ops_list = ops_by_order.get(order_id, [])
+            if not parent_ops_list:
                 continue
-            ops_target = _collect_ops_recursive(
-                target_po_id, children_map, ops_by_order, schedulable_op_ids
-            )
-            if not ops_target:
-                logger.debug("RP target %s: nessuna op schedulabile — skip", target_po_id)
+            # Raccoglie TUTTE le op schedulabili di TUTTI i figli (DFS ricorsivo)
+            all_child_ops: list[uuid.UUID] = []
+            for child_id in child_ids:
+                all_child_ops.extend(_collect_ops_recursive(
+                    child_id, children_map, ops_by_order, schedulable_op_ids
+                ))
+            # Deduplicazione preservando l'ordine
+            seen_bom: set[uuid.UUID] = set()
+            unique_child_ops = [
+                x for x in all_child_ops if not (x in seen_bom or seen_bom.add(x))
+            ]
+            if not unique_child_ops:
                 continue
-            parent_wait_constraints.append((ops_target, op_sc.id))
+            for parent_op_id in parent_ops_list:
+                parent_wait_constraints.append((unique_child_ops, parent_op_id))
             logger.debug(
-                "Parent-wait: op %s aspetta %d op del target %s",
-                op_sc.id, len(ops_target), target_po_id,
+                "BOM wait: ordine %s (%d op padre) aspetta %d op figlie",
+                order_id, len(parent_ops_list), len(unique_child_ops),
             )
 
-        logger.info("Step 4d: %d parent_wait_constraints generati", len(parent_wait_constraints))
-    # (Operation-level pairs are derived from reference-point precedences — stub)
+        logger.info(
+            "Step 4d: %d parent_wait_constraints (BOM HARD ordine-livello, %d ordini con figli)",
+            len(parent_wait_constraints), len([k for k, v in children_map.items() if v]),
+        )
+    # ── Calcolo priorità di dispatch (SOFT) ──────────────────────────────────
+    # Le op foglia (GROUP/COMPONENT) non hanno vincoli hard tra di loro: la priorità
+    # guida solo la dispatch queue del greedy quando le risorse sono limitate.
+    # Con risorse libere tutte le op pronte partono in parallelo.
+    #
+    # op_priority = rp_level_ordine × 10000
+    #   rp_level = livello nel DAG RP dell'ordine di appartenenza dell'op
+    #   (livello ereditato: GRP-032 sotto AGG-001 sotto RP-01 → level 0)
+    #
+    # NON si usa più sequence_number: l'ordinamento deriva solo dai RP.
 
-    # ── Step 5-7: Horizon + CP-SAT ────────────────────────────────────────────
-    from app.core.scheduler.cpsat_model_builder import CpsatModelBuilder
+    _op_to_order: dict[uuid.UUID, uuid.UUID] = {
+        op_sc.id: op_sc.production_order_id for op_sc in schedulable_ops
+    }
+    _order_preds_lv: dict[uuid.UUID, set[uuid.UUID]] = defaultdict(set)
+    for _ops_pred_lv, _ops_succ_lv in rp_order_constraints:
+        _pred_ords = {_op_to_order[oid] for oid in _ops_pred_lv if oid in _op_to_order}
+        _succ_ords = {_op_to_order[oid] for oid in _ops_succ_lv if oid in _op_to_order}
+        for _so in _succ_ords:
+            _order_preds_lv[_so].update(_pred_ords)
+
+    _all_order_ids = {op.production_order_id for op in schedulable_ops}
+    _rp_level: dict[uuid.UUID, int] = {oid: 0 for oid in _all_order_ids}
+    _changed = True
+    while _changed:
+        _changed = False
+        for _oid in _all_order_ids:
+            for _pred_ord in _order_preds_lv.get(_oid, set()):
+                _new_lv = _rp_level.get(_pred_ord, 0) + 1
+                if _new_lv > _rp_level[_oid]:
+                    _rp_level[_oid] = _new_lv
+                    _changed = True
+
+    # Intra-routing RP depth: per dare priorità anche all'ordine delle op all'interno
+    # del routing (rp_direct_pairs). Se op-A deve precedere op-B secondo il DAG RP
+    # intra-routing, op-A ha depth più bassa → viene dispatchata prima.
+    # Questo è SOFT: se op-A è bloccata (mancanti) op-B può comunque partire.
+    _op_intra_depth: dict[uuid.UUID, int] = {op_sc.id: 0 for op_sc in schedulable_ops}
+    _intra_changed = True
+    while _intra_changed:
+        _intra_changed = False
+        for _pred_id, _succ_id in precedence_pairs:
+            _new_depth = _op_intra_depth.get(_pred_id, 0) + 1
+            if _new_depth > _op_intra_depth.get(_succ_id, 0):
+                _op_intra_depth[_succ_id] = _new_depth
+                _intra_changed = True
+
+    op_priority: dict[uuid.UUID, int] = {
+        op_sc.id: _rp_level.get(op_sc.production_order_id, 0) * 10000
+                  + _op_intra_depth.get(op_sc.id, 0)
+        for op_sc in schedulable_ops
+    }
+    logger.info(
+        "Priorità dispatch calcolate: %d op, max RP level=%d, max intra-depth=%d",
+        len(op_priority), max(_rp_level.values(), default=0),
+        max(_op_intra_depth.values(), default=0),
+    )
+
+    # ── Step 5: Orizzonte (solo bound di sicurezza per il greedy) ─────────────
+    # Lo scheduler greedy riempie le prime finestre disponibili: l'orizzonte serve
+    # solo come limite anti-loop. Usiamo il target se presente, altrimenti 1 anno.
     from app.core.scheduler.shift_preprocessor import compute_horizon_minutes
-
-    # L'orizzonte determina il dominio delle variabili CP-SAT.
-    # Troppo grande (es. 1 anno) rende il modello intrattabile.
-    # Usiamo: target_finish_date se presente, altrimenti la fine del calendario
-    # operatori (max 90 giorni da oggi come fallback sicuro).
     from datetime import timedelta
 
-    if calendar_rows:
-        max_cal_date = max(c.date for c in calendar_rows)
-        calendar_horizon_date = max_cal_date + timedelta(days=7)
-    else:
-        calendar_horizon_date = date.today() + timedelta(days=90)
-
     if scenario.target_finish_date:
-        target_date = date.fromisoformat(str(scenario.target_finish_date))
-        horizon_date = min(target_date, calendar_horizon_date)
-        if target_date > calendar_horizon_date:
-            logger.warning(
-                "Target finish date %s exceeds available operator calendar ending %s; "
-                "clamping horizon to %s.",
-                target_date,
-                max_cal_date if calendar_rows else target_date,
-                calendar_horizon_date,
-            )
+        horizon_date = date.fromisoformat(str(scenario.target_finish_date))
     else:
-        horizon_date = calendar_horizon_date
+        horizon_date = schedule_start_date + timedelta(days=365)
 
     horizon = compute_horizon_minutes(horizon_date, epoch)
-    logger.info("CP-SAT horizon: %s (%d minutes)", horizon_date, horizon)
-
-    builder = CpsatModelBuilder(
-        operations=schedulable_ops,
-        operators=qualified_operators,
-        horizon_minutes=horizon,
-        epoch=epoch,
-        missing_components_constraints=missing_constraints,
-        precedence_pairs=precedence_pairs,
-    )
+    logger.info("Scheduling horizon: %s (%d minutes)", horizon_date, horizon)
 
     objective_mode = scenario.objective_mode.value if scenario.objective_mode else "FINISH_BY_DATE"
-    params: dict = {}
-    if scenario.target_finish_date:
-        target_dt = datetime(
-            scenario.target_finish_date.year,
-            scenario.target_finish_date.month,
-            scenario.target_finish_date.day,
-            23, 59, tzinfo=timezone.utc,
-        )
-        params["target_finish_minutes"] = datetime_to_minutes(target_dt, epoch)
-    
-    total_work = sum(op.planned_duration_minutes for op in schedulable_ops)
-    total_capacity = sum(
-        (e - s) for o in qualified_operators for s, e in o.available_slots
-    )
-    logger.info(
-        "Carico totale: %d min (%.1f giorni-persona), "
-        "Capacità totale operatori: %d min (%.1f giorni-persona)",
-        total_work, total_work / 480,
-        total_capacity, total_capacity / 480,
-    )
 
-    # Quante ops non hanno NESSUN operatore qualificato?
-    from app.core.scheduler.cpsat_types import operator_can_do
+    total_work = sum(op.planned_duration_minutes for op in schedulable_ops)
+
+    # Op senza alcun gruppo risorse compatibile (workcenter + skill)
+    from app.core.scheduler.cpsat_types import _SKILL_CAN_DO
     orphan_ops = []
     for op in schedulable_ops:
-        qualified = [
-            o for o in qualified_operators
-            if o.workcenter_id == op.workcenter_id
-            and operator_can_do(o, op.operation_type)
-            and o.available_slots
-        ]
-        if not qualified:
+        has_group = any(
+            g.workcenter_id == op.workcenter_id
+            and op.operation_type in _SKILL_CAN_DO.get(g.skill, set())
+            for g in resource_groups
+        )
+        if not has_group:
             orphan_ops.append((op.id, op.operation_type, op.workcenter_id))
-
-    logger.info("Operazioni senza operatori qualificati: %d", len(orphan_ops))
+    logger.info("Operazioni senza gruppo risorse: %d", len(orphan_ops))
     for op_id, op_type, wc_id in orphan_ops[:10]:
         logger.info("  → %s tipo=%s wc=%s", op_id, op_type, wc_id)
 
     impossible_ops = [
-        op for op in schedulable_ops 
+        op for op in schedulable_ops
         if op.earliest_start_minutes + op.planned_duration_minutes > horizon
     ]
     logger.warning("Operazioni impossible (earliest+dur > horizon): %d", len(impossible_ops))
-
-    first_slots = [(str(q.id)[:8], q.available_slots[:2]) for q in qualified_operators[:3]]
-    logger.info("Primi slot operatori: %s", first_slots)
     logger.info("Epoch: %s, Horizon: %d min (%s)", epoch, horizon, horizon_date)
 
-    solution = builder.build_and_solve(
-        objective_mode=scenario.objective_mode or "FINISH_BY_DATE",
-        params={},
-        blocking_constraints={},        # non più usato per i RP (ora rp_order_constraints)
-        rp_order_constraints=rp_order_constraints,   # ← NUOVO
-        scenario_id=scenario_id,
+    # ── Scheduling a capacità di gruppo ───────────────────────────────────────
+    # 1) greedy (capacity_scheduler): veloce, sempre fattibile → orizzonte stretto + warm-start
+    # 2) CP-SAT cumulativo (capacity_cpsat): OTTIMIZZA (makespan / FINISH_BY_DATE) partendo
+    #    dall'hint del greedy. Se non migliora o va in timeout → fallback al greedy.
+    import os as _os
+    import time as _time
+    from app.core.scheduler.capacity_scheduler import CapacityScheduler
+
+    _t0 = _time.perf_counter()
+    greedy_result = CapacityScheduler(
+        operations=schedulable_ops,
+        resource_groups=resource_groups,
+        horizon_minutes=horizon,
+        epoch=epoch,
+        precedence_pairs=precedence_pairs,
+        rp_order_constraints=rp_order_constraints,
         parent_wait_constraints=parent_wait_constraints,
+        missing_constraints=missing_constraints,
+        op_priority=op_priority,
+    ).solve()
+
+    cap_result = greedy_result
+    engine_used = "greedy"
+
+    use_cpsat = _os.getenv("CPSAT_CAPACITY_ENABLED", "1") == "1"
+    if use_cpsat and greedy_result.status == "OPTIMAL" and greedy_result.makespan_minutes:
+        from app.core.scheduler.capacity_cpsat import CapacityCpsatScheduler
+
+        margin = float(_os.getenv("CPSAT_CAPACITY_HORIZON_MARGIN", "1.5"))
+        cpsat_horizon = min(horizon, int(greedy_result.makespan_minutes * margin) + 1440)
+        target_min: int | None = None
+        if scenario.target_finish_date:
+            _tdt = datetime(
+                scenario.target_finish_date.year, scenario.target_finish_date.month,
+                scenario.target_finish_date.day, 23, 59, tzinfo=timezone.utc,
+            )
+            target_min = datetime_to_minutes(_tdt, epoch)
+        cpsat_result = CapacityCpsatScheduler(
+            operations=schedulable_ops,
+            resource_groups=resource_groups,
+            horizon_minutes=cpsat_horizon,
+            epoch=epoch,
+            precedence_pairs=precedence_pairs,
+            rp_order_constraints=rp_order_constraints,
+            parent_wait_constraints=parent_wait_constraints,
+            missing_constraints=missing_constraints,
+            objective_mode=objective_mode,
+            target_finish_minutes=target_min,
+            timeout_seconds=float(_os.getenv("CPSAT_CAPACITY_TIMEOUT", "30")),
+            warm_start=greedy_result,
+        ).solve()
+        if cpsat_result.status in ("OPTIMAL", "FEASIBLE") and cpsat_result.entries:
+            cap_result = cpsat_result
+            engine_used = "cpsat"
+        else:
+            logger.info(
+                "CP-SAT capacità non utilizzabile (status=%s) → fallback greedy",
+                cpsat_result.status,
+            )
+
+    solve_seconds = round(_time.perf_counter() - _t0, 3)
+    scheduled_op_ids = {e.operation_id for e in cap_result.entries}
+    resources_used = len({(e.workcenter_id, e.skill, e.lane_index) for e in cap_result.entries})
+    logger.info(
+        "Motore=%s %s in %.3fs: %d op schedulate, %d entries, makespan=%s min",
+        engine_used, cap_result.status, solve_seconds, len(scheduled_op_ids),
+        len(cap_result.entries), cap_result.makespan_minutes,
     )
 
     makespan_days = (
-        round(solution.makespan_minutes / 1440, 2)
-        if solution.makespan_minutes is not None
+        round(cap_result.makespan_minutes / 1440, 2)
+        if cap_result.makespan_minutes is not None
         else None
     )
 
+    # ── Entries (datetime) dai blocchi del greedy ─────────────────────────────
+    from app.core.scheduler.shift_preprocessor import minutes_to_datetime
+    from app.enums import ScheduleEntryStatus
+
+    db_entries: list[ScheduleEntry] = [
+        ScheduleEntry(
+            id=uuid.uuid4(),
+            scenario_id=scenario_id,
+            operation_id=e.operation_id,
+            operator_id=None,                       # capacità di gruppo → niente operatore con nome
+            resource_type_id=e.resource_type_id,
+            workcenter_id=e.workcenter_id,
+            scheduled_start=minutes_to_datetime(e.start_minutes, epoch),
+            scheduled_end=minutes_to_datetime(e.end_minutes, epoch),
+            status=ScheduleEntryStatus.SCHEDULED,
+            delay_minutes=0,
+            is_manual_override=False,
+        )
+        for e in cap_result.entries
+    ]
+
+    earliest_start_iso: str | None = None
+    latest_end_iso: str | None = None
+    if db_entries:
+        earliest_start_iso = min(e.scheduled_start for e in db_entries).isoformat()
+        latest_end_iso = max(e.scheduled_end for e in db_entries).isoformat()
+
+    # ── Workcenter breakdown ──────────────────────────────────────────────────
+    from collections import Counter as _Counter
+    wc_op_counts = _Counter(str(op.workcenter_id) for op in schedulable_ops)
+    wc_group_caps: dict[str, int] = defaultdict(int)
+    for g in resource_groups:
+        wc_group_caps[str(g.workcenter_id)] += g.weekly_capacity_minutes
+    workcenter_breakdown = [
+        {
+            "workcenter_id": wc_id,
+            "ops_count": wc_op_counts[wc_id],
+            "group_capacity_min_per_week": wc_group_caps.get(wc_id, 0),
+        }
+        for wc_id in sorted(wc_op_counts.keys())
+    ]
+
+    run_summary: dict = {
+        # ── Input ──────────────────────────────────────────────────────────
+        "schedule_start_date": str(schedule_start_date),
+        "horizon_date": str(horizon_date),
+        "objective_mode": objective_mode,
+        "triggered_by": triggered_by,
+        "total_schedulable_ops": len(schedulable_ops),
+        "total_work_minutes": total_work,
+        "group_capacity_min_per_week": group_daily_capacity,
+        "resource_groups_total": len(resource_groups),
+        "workcenter_breakdown": workcenter_breakdown,
+        # ── Vincoli applicati ──────────────────────────────────────────────
+        "in_progress_anchored": len(in_progress_op_ids),
+        "missing_constraints_active": len(missing_constraints),
+        "rp_order_constraints_count": len(rp_order_constraints),
+        "parent_wait_constraints_count": len(parent_wait_constraints),
+        "orphan_ops_count": len(orphan_ops),
+        "impossible_ops_count": len(impossible_ops),
+        # ── Risultato ──────────────────────────────────────────────────────
+        "engine_used": engine_used,
+        "solver_status": cap_result.status,
+        "solve_time_seconds": solve_seconds,
+        "scheduled_ops": len(scheduled_op_ids),
+        "scheduled_entries": len(db_entries),
+        "resources_used": resources_used,
+        "operators_used": resources_used,   # retrocompat campo storico
+        "makespan_days": makespan_days,
+        "earliest_start": earliest_start_iso,
+        "latest_end": latest_end_iso,
+        "conflicts": cap_result.conflicts or [],
+    }
+
     # Salva risultato nello scenario
-    from datetime import datetime, timezone as tz
     scenario_obj = session.get(ScheduleScenario, scenario_id)
     if scenario_obj:
-        scenario_obj.last_run_status = solution.status
-        scenario_obj.last_run_at = datetime.now(tz.utc)
+        scenario_obj.last_run_status = cap_result.status
+        scenario_obj.last_run_at = datetime.now(timezone.utc)
         scenario_obj.last_run_makespan_days = makespan_days
-        scenario_obj.last_run_operators_used = solution.operators_used
-        scenario_obj.last_run_conflicts = solution.conflicts if solution.status == "INFEASIBLE" else None
+        scenario_obj.last_run_operators_used = resources_used
+        scenario_obj.last_run_conflicts = cap_result.conflicts if cap_result.status == "INFEASIBLE" else None
+        scenario_obj.last_run_summary = run_summary
 
     # ── Step 8: Persist new entries ───────────────────────────────────────────
-    if solution.status in ("OPTIMAL", "FEASIBLE"):
-        for entry_schema in solution.schedule_entries:
-            entry = ScheduleEntry(
-                id=uuid.uuid4(),
-                scenario_id=entry_schema.scenario_id,
-                operation_id=entry_schema.operation_id,
-                operator_id=entry_schema.operator_id,
-                workcenter_id=entry_schema.workcenter_id,
-                scheduled_start=entry_schema.scheduled_start,
-                scheduled_end=entry_schema.scheduled_end,
-                status=entry_schema.status,
-                delay_minutes=0,
-                is_manual_override=False,
-            )
+    if cap_result.status in ("OPTIMAL", "FEASIBLE") and db_entries:
+        for entry in db_entries:
             session.add(entry)
 
     # ── Step 9: Delete STALE entries ──────────────────────────────────────────
     _cleanup_stale(session, scenario_id)
 
-
-
     return {
-        "status": solution.status,
+        "status": cap_result.status,
         "scenario_id": str(scenario_id),
         "makespan_days": makespan_days,
-        "operators_used": solution.operators_used,
-        "conflicts": solution.conflicts,
+        "operators_used": resources_used,
+        "conflicts": cap_result.conflicts,
+        "summary": run_summary,
     }
 
 

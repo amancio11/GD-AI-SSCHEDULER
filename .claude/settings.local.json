@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Bash(grep -E \"\\\\.\\(py|json\\)$\")",
+      "Bash(python -c \"from app.core.scheduler.cpsat_model_builder import CpsatModelBuilder; print\\('OK'\\)\")",
+      "Bash(ls venv* .venv)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('app/core/scheduler/cpsat_model_builder.py'\\).read\\(\\)\\); ast.parse\\(open\\('app/core/scheduler/cpsat_types.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c \"import ortools; print\\('ortools', ortools.__version__\\)\")",
+      "Bash(./.venv/Scripts/python.exe -c ' *)",
+      "Bash(cd *)",
+      "Bash(./.venv/Scripts/python.exe /tmp/claude-1000/-mnt-c-Users-andreamancini-Downloads-gd-scheduler/6c417bc3-2678-4611-bea2-55c80b01c13e/scratchpad/test_handoff.py)",
+      "Bash(grep -v \"^I0\\\\|cp_model\\\\|search\\\\|Parameters\\\\|#Bool\\\\|#kIntervals\\\\|Starting\\\\|Preloading\\\\|^$\")",
+      "Bash(./.venv/Scripts/python.exe ./_tmp_test_handoff.py)",
+      "Bash(grep -vE \"^I[0-9]|log_search|Parameters|^#|Starting|Preloading|objective_|^\\\\s*$|walltime|booleans|reduced|restarts|conflicts:|^c |branches\")",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_cpsat_constraints.py tests/test_solution_extractor.py -q)",
+      "Bash(git stash *)",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_cpsat_constraints.py -q)",
+      "Bash(git --no-pager stash list)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(git --no-pager status --short)",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/ -q -p no:cacheprovider)",
+      "Bash(timeout 180 node_modules/.bin/tsc --noEmit)",
+      "Bash(tee /tmp/tsc.out)",
+      "Bash(./.venv/Scripts/python.exe -c \"import psycopg2; print\\('psycopg2', psycopg2.__version__\\)\")",
+      "Bash(python3 -c \"import yaml,sys; d=yaml.safe_load\\(open\\('podman-compose.yml'\\)\\); print\\('YAML OK — servizi:', list\\(d['services'].keys\\(\\)\\)\\); print\\('volumes:', list\\(d.get\\('volumes',{}\\).keys\\(\\)\\)\\)\")",
+      "Bash(command -v podman docker docker-compose podman-compose)",
+      "Bash(./.venv/Scripts/python.exe -m pip index versions psycopg2-binary)",
+      "Bash(./.venv/Scripts/python.exe -m pip install \"psycopg2-binary==99.99\")",
+      "Bash(git log *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app/core/scheduler/cpsat_model_builder.py'\\).read\\(\\)\\); print\\('OK syntax'\\)\")",
+      "Bash(python *)",
+      "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('app/core/scheduler/cpsat_model_builder.py'\\).read\\(\\)\\); print\\('OK syntax'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('app/core/scheduler/cpsat_model_builder.py'\\).read\\(\\)\\); print\\('OK syntax'\\)\")",
+      "Bash(python3 *)",
+      "Bash(xargs -I{} basename {})",
+      "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('app/core/scheduler/reschedule_engine.py'\\).read\\(\\)\\); print\\('OK reschedule_engine'\\)\")",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(node_modules/.bin/tsc --noEmit --skipLibCheck)"
+    ]
+  }
+}

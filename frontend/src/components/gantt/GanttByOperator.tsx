@@ -43,13 +43,16 @@ export default function GanttByOperator({
 
   const byOperator = useMemo(() => groupByOperator(entries), [entries]);
 
-  // Build rows: operators sorted by name
+  // Righe = gruppi risorsa presenti nelle entries (capacità di gruppo, non più
+  // operatori con nome). Etichetta = operator_name (= label del gruppo risorsa).
   const rows = useMemo(() => {
-    return operators.map((op) => ({
-      operator: op,
-      entries: byOperator.get(op.id) ?? [],
-    }));
-  }, [operators, byOperator]);
+    const out: { id: string; label: string; entries: GanttEntry[] }[] = [];
+    for (const [groupId, ents] of byOperator.entries()) {
+      out.push({ id: groupId, label: ents[0]?.operator_name ?? groupId, entries: ents });
+    }
+    out.sort((a, b) => a.label.localeCompare(b.label));
+    return out;
+  }, [byOperator]);
 
   const todayX = xOffset(new Date().toISOString(), originDate, zoom);
 
@@ -93,9 +96,9 @@ export default function GanttByOperator({
           style={{ left: todayX }}
         />
 
-        {rows.map(({ operator, entries: opEntries }) => (
+        {rows.map(({ id, entries: opEntries }) => (
           <div
-            key={operator.id}
+            key={id}
             className="relative border-b border-border"
             style={{ height: ROW_HEIGHT }}
           >

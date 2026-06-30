@@ -5,7 +5,6 @@ import {
   BarChart3,
   GitBranch,
   Calendar,
-  Network,
   Layers,
   AlertTriangle,
   PackageX,
@@ -20,6 +19,7 @@ import {
   Database,
   GitFork,
   Cpu,
+  Boxes,
 } from 'lucide-react';
 import { useUiStore } from '../../store/uiStore';
 import { useAiStore } from '../../store/aiStore';
@@ -34,7 +34,7 @@ const NAV_ITEMS = [
   { to: '/gantt',            label: 'Gantt',              icon: BarChart3 },
   { to: '/bom',              label: 'BOM Explorer',       icon: GitBranch },
   { to: '/calendar',         label: 'Calendario',         icon: Calendar },
-  { to: '/reference-points', label: 'Reference Points',   icon: Network },
+  { to: '/resources',        label: 'Risorse',            icon: Boxes },
   { to: '/scenarios',        label: 'Scenari',            icon: Layers },
   { to: '/delays',           label: 'Ritardi',            icon: AlertTriangle },
   { to: '/missing',          label: 'Mancanti',           icon: PackageX },

@@ -32,6 +32,7 @@ class ScheduleScenario(UUIDMixin, TimestampMixin, Base):
         nullable=False,
         default=ObjectiveMode.FINISH_BY_DATE,
     )
+    start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     target_finish_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     resource_set_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -43,6 +44,7 @@ class ScheduleScenario(UUIDMixin, TimestampMixin, Base):
     last_run_makespan_days: Mapped[float | None] = mapped_column(Float, nullable=True)
     last_run_operators_used: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_run_conflicts: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    last_run_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # Relationships
     machine_order: Mapped[MachineOrder] = relationship(
@@ -69,8 +71,13 @@ class ScheduleEntry(UUIDMixin, Base):
     operation_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("operations.id"), nullable=False, index=True
     )
-    operator_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("operators.id"), nullable=False
+    # Nullable: nel modello a capacità le entries referenziano un gruppo risorse,
+    # non un operatore con nome.
+    operator_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("operators.id"), nullable=True
+    )
+    resource_type_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("resource_types.id"), nullable=True
     )
     workcenter_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("workcenters.id"), nullable=False
@@ -93,7 +100,7 @@ class ScheduleEntry(UUIDMixin, Base):
         "ScheduleScenario", back_populates="entries", lazy="selectin"
     )
     operation: Mapped[Operation] = relationship("Operation", lazy="selectin")
-    operator: Mapped[Operator] = relationship("Operator", lazy="selectin")
+    operator: Mapped[Operator | None] = relationship("Operator", lazy="selectin")
     workcenter: Mapped[Workcenter] = relationship("Workcenter", lazy="selectin")
 
     def __repr__(self) -> str:

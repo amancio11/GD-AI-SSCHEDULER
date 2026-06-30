@@ -30,10 +30,11 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import apiClient from '../api/client';
 import { useMachineStore } from '../store/machineStore';
 import { useScheduleStore } from '../store/scheduleStore';
-import type { ScheduleScenario } from '../api/types';
+import type { ScheduleScenario, ScheduleRunSummary } from '../api/types';
 import {
   Play, Plus, Loader2, Info, ArrowUpDown, TrendingDown, TrendingUp, Minus,
-  CheckCircle, Target, Users, Calendar, Zap,
+  CheckCircle, Target, Users, Calendar, Zap, ChevronDown,
+  AlertTriangle, Link, Database,
 } from 'lucide-react';
 
 // ── Tipi ─────────────────────────────────────────────────────────────────────
@@ -51,30 +52,35 @@ interface ScenarioComparisonResult {
 const OBJECTIVE_META: Record<string, {
   label: string;
   description: string;
+  detail: string;
   icon: React.ReactNode;
   color: string;
 }> = {
   FINISH_BY_DATE: {
     label: 'Finisci entro data',
-    description: 'Il solver privilegia il completamento entro la data target. Utile quando c\'è una consegna ferma al cliente.',
+    description: 'Il piano deve chiudersi entro la data target. Se impossibile il solver segnala INFEASIBLE.',
+    detail: 'Vincolo hard: makespan ≤ data_target. Poi minimizza la durata totale. Richiede che "Data target di completamento" sia impostata. Utile quando c\'è una consegna ferma al cliente.',
     icon: <Calendar size={14} />,
     color: 'blue',
   },
   MAXIMIZE_RESOURCE_UTILIZATION: {
     label: 'Massimizza utilizzo risorse',
-    description: 'Minimizza i tempi morti degli operatori. Utile per massimizzare la produttività dell\'impianto.',
+    description: 'Minimizza la durata totale del piano e distribuisce il lavoro su tutti i gruppi disponibili.',
+    detail: 'Obiettivo primario: finire il prima possibile (makespan minimo). Obiettivo secondario: usare il maggior numero di gruppi-risorsa possibile, così nessuna risorsa rimane idle mentre un\'altra è satura. Utile per massimizzare la produttività dell\'impianto.',
     icon: <Zap size={14} />,
     color: 'green',
   },
   MINIMIZE_OPERATORS: {
-    label: 'Minimizza operatori',
-    description: 'Usa il minor numero possibile di operatori distinti. Utile per pianificare con risorse limitate.',
+    label: 'Minimizza gruppi risorsa',
+    description: 'Concentra il lavoro sul minor numero possibile di gruppi risorsa distinti.',
+    detail: 'Obiettivo primario: minimizza i gruppi (workcenter+skill) effettivamente usati. Obiettivo secondario: minimizza makespan a parità di gruppi. Utile per pianificare con crew ridotta, turni limitati o impianti parzialmente attivi.',
     icon: <Users size={14} />,
     color: 'purple',
   },
   CUSTOM: {
-    label: 'Personalizzato',
-    description: 'Combina i tre obiettivi con pesi personalizzati. Per pianificatori esperti.',
+    label: 'Solo makespan',
+    description: 'Minimizza la durata totale del piano senza vincoli aggiuntivi sulla distribuzione delle risorse.',
+    detail: 'Obiettivo puro: Minimize(makespan). Nessun peso secondario su gruppi o distribuzione. Equivale a MAXIMIZE_RESOURCE_UTILIZATION ma senza il termine di bilanciamento. Utile come baseline di confronto.',
     icon: <Target size={14} />,
     color: 'orange',
   },
@@ -90,6 +96,7 @@ interface TaskResult {
   makespan_days?: number;
   operators_used?: number;
   conflicts?: string[];
+  summary?: ScheduleRunSummary;
 }
 
 function useTaskPoller(taskId: string | null, onComplete: (result?: TaskResult) => void) {
@@ -144,6 +151,7 @@ function ScenarioCard({
   onDelete: () => void;
   onSchedule: () => void;
 }) {
+  const [showReport, setShowReport] = useState(false);
   const meta = OBJECTIVE_META[scenario.objective_mode];
   const colorMap: Record<string, string> = {
     blue: 'border-blue-600/60 bg-blue-900/10',
@@ -222,9 +230,49 @@ function ScenarioCard({
 
       {/* Descrizione obiettivo inline */}
       {meta && (
-        <p className="text-[11px] text-muted-foreground mb-3 leading-relaxed">
+        <p className="text-[11px] text-muted-foreground mb-2 leading-relaxed">
           {meta.description}
         </p>
+      )}
+
+      {/* Date di scheduling */}
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 mb-2">
+        {scenario.start_date && (
+          <p className="text-[10px] text-muted-foreground">
+            Inizio: <span className="text-foreground font-medium">
+              {new Date(scenario.start_date).toLocaleDateString('it-IT', { day: '2-digit', month: 'short', year: 'numeric' })}
+            </span>
+          </p>
+        )}
+        {scenario.target_finish_date && (
+          <p className="text-[10px] text-blue-300">
+            Target: <span className="font-medium">
+              {new Date(scenario.target_finish_date).toLocaleDateString('it-IT', { day: '2-digit', month: 'short', year: 'numeric' })}
+            </span>
+          </p>
+        )}
+      </div>
+
+      {/* KPI ultimo run */}
+      {(scenario.last_run_makespan_days != null || scenario.last_run_operators_used != null) && (
+        <div className="flex gap-3 mb-2 text-[10px] text-muted-foreground">
+          {scenario.last_run_makespan_days != null && (
+            <span>Durata: <span className="text-foreground font-medium">{scenario.last_run_makespan_days}gg</span></span>
+          )}
+          {scenario.last_run_operators_used != null && (
+            <span>Operatori: <span className="text-foreground font-medium">{scenario.last_run_operators_used}</span></span>
+          )}
+        </div>
+      )}
+
+      {/* Link al report dettagliato */}
+      {scenario.last_run_summary && (
+        <button
+          onClick={(e) => { e.stopPropagation(); setShowReport(true); }}
+          className="text-[10px] text-primary hover:underline mb-2 flex items-center gap-1"
+        >
+          <ChevronDown size={10} /> Vedi report scheduling
+        </button>
       )}
 
       <p className="text-[10px] text-muted-foreground mb-3">
@@ -272,6 +320,15 @@ function ScenarioCard({
           ✕
         </button>
       </div>
+
+      {/* Report modal */}
+      {showReport && scenario.last_run_summary && (
+        <SchedulingReportModal
+          summary={scenario.last_run_summary as ScheduleRunSummary}
+          scenarioName={scenario.name}
+          onClose={() => setShowReport(false)}
+        />
+      )}
     </div>
   );
 }
@@ -282,65 +339,460 @@ function ScenarioGuideModal({ onClose }: { onClose: () => void }) {
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={onClose}>
       <div
-        className="bg-background border border-border rounded-xl p-6 max-w-2xl w-full max-h-[80vh] overflow-y-auto"
+        className="bg-background border border-border rounded-xl p-6 max-w-2xl w-full max-h-[85vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-5">
           <h2 className="text-base font-bold">Guida agli Scenari di Scheduling</h2>
-          <button onClick={onClose} className="text-muted-foreground hover:text-foreground">✕</button>
+          <button onClick={onClose} className="text-muted-foreground hover:text-foreground text-lg leading-none">✕</button>
         </div>
 
-        <div className="space-y-5 text-sm">
+        <div className="space-y-6 text-sm">
+
+          {/* Cos'è uno scenario */}
           <div>
             <h3 className="font-semibold mb-2 text-primary">Cos'è uno Scenario?</h3>
-            <p className="text-muted-foreground leading-relaxed">
+            <p className="text-foreground/80 leading-relaxed">
               Uno scenario è un piano di scheduling completo e indipendente per la macchina.
-              Puoi creare più scenari con obiettivi diversi e confrontarli per scegliere il piano migliore
-              da rendere "attivo" (quello che diventa il piano ufficiale di produzione).
+              Puoi creare più scenari con obiettivi diversi, eseguire il solver CP-SAT su ciascuno
+              e confrontarli per scegliere il piano migliore da rendere ATTIVO.
             </p>
           </div>
 
+          {/* ATTIVO vs BASELINE */}
+          <div>
+            <h3 className="font-semibold mb-3">ATTIVO e BASELINE — cosa significano</h3>
+            <div className="grid grid-cols-1 gap-3">
+              <div className="flex gap-3 p-3 border border-green-500/40 bg-green-500/10 rounded-lg">
+                <span className="text-[10px] bg-green-600 text-white rounded px-1.5 py-0.5 font-bold shrink-0 self-start mt-0.5">ATTIVO</span>
+                <div className="space-y-1">
+                  <p className="font-medium text-foreground">Piano ufficiale della macchina</p>
+                  <p className="text-foreground/70 text-xs leading-relaxed">
+                    Un solo scenario per macchina può essere ATTIVO. Attivare uno scenario de-attiva automaticamente il precedente.
+                    È il piano che il sistema usa operativamente: quando arriva un evento di ritardo, il{" "}
+                    <strong>delay_propagation engine</strong> rileva lo scenario attivo e avvia automaticamente
+                    il reschedule su di esso. Il Gantt mostra le schedule entries di questo scenario.
+                  </p>
+                  <p className="text-foreground/60 text-xs">
+                    Tipicamente si attiva lo scenario migliore dopo averli confrontati.
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-3 p-3 border border-blue-500/40 bg-blue-500/10 rounded-lg">
+                <span className="text-[10px] bg-blue-600 text-white rounded px-1.5 py-0.5 font-bold shrink-0 self-start mt-0.5">BASELINE</span>
+                <div className="space-y-1">
+                  <p className="font-medium text-foreground">Snapshot di riferimento per il confronto</p>
+                  <p className="text-foreground/70 text-xs leading-relaxed">
+                    Il BASELINE è un piano congelato che non viene toccato dai reschedule automatici
+                    e non guida il Gantt. Il suo scopo è nella sezione <strong>Confronta scenari</strong>:
+                    puoi metterlo a fianco di qualsiasi altro scenario per vedere i delta di makespan,
+                    operatori usati e numero di entries.
+                  </p>
+                  <p className="text-foreground/60 text-xs">
+                    Tipicamente si imposta come baseline il piano approvato prima di iniziare la produzione,
+                    poi si confrontano i reschedule successivi contro di esso per capire quanto il piano è cambiato.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Tipi di obiettivo */}
           <div>
             <h3 className="font-semibold mb-3">Tipi di Obiettivo</h3>
-            <div className="space-y-3">
+            <div className="space-y-2">
               {Object.entries(OBJECTIVE_META).map(([key, meta]) => (
                 <div key={key} className="flex gap-3 p-3 border border-border rounded-lg">
-                  <div className={`mt-0.5 text-${meta.color}-400`}>{meta.icon}</div>
+                  <div className="mt-0.5 shrink-0 text-foreground/60">{meta.icon}</div>
                   <div>
-                    <p className="font-medium text-sm">{meta.label}</p>
-                    <p className="text-muted-foreground text-xs mt-0.5 leading-relaxed">{meta.description}</p>
+                    <p className="font-medium text-sm text-foreground">{meta.label}</p>
+                    <p className="text-foreground/60 text-xs mt-0.5 leading-relaxed">{meta.description}</p>
                   </div>
                 </div>
               ))}
             </div>
           </div>
 
+          {/* Workflow */}
           <div>
             <h3 className="font-semibold mb-2">Workflow tipico</h3>
-            <ol className="space-y-2 text-muted-foreground text-xs">
+            <ol className="space-y-2 text-xs">
               {[
                 'Crea 2-3 scenari con obiettivi diversi (es. "Finisci entro 30/8" e "Minimizza operatori")',
-                'Esegui lo scheduling su ciascuno — CP-SAT calcola il piano ottimale',
-                'Usa "Confronta" per vedere i delta di makespan e numero operatori',
-                'Attiva lo scenario migliore → diventa il piano ufficiale',
+                'Esegui lo scheduling su ciascuno — CP-SAT calcola il piano ottimale per ogni obiettivo',
+                'Usa "Confronta" per vedere i delta di makespan e numero operatori tra due scenari',
+                'Imposta come BASELINE il piano approvato prima di iniziare',
+                'Attiva lo scenario migliore → diventa il piano ufficiale, tutti i ritardi verranno rischedulati su di esso',
                 'Se cambiano i dati (nuovi ritardi, componenti mancanti) → ri-esegui lo scheduling',
               ].map((step, i) => (
-                <li key={i} className="flex gap-2">
-                  <span className="text-primary font-bold">{i + 1}.</span>
+                <li key={i} className="flex gap-2 text-foreground/70">
+                  <span className="text-primary font-bold shrink-0">{i + 1}.</span>
                   <span>{step}</span>
                 </li>
               ))}
             </ol>
           </div>
 
-          <div className="border border-amber-600/30 bg-amber-900/20 rounded p-3">
-            <p className="text-amber-200 text-xs leading-relaxed">
-              <strong>Nota:</strong> Solo uno scenario può essere ATTIVO alla volta per macchina.
-              Il piano BASELINE è il riferimento di confronto (es. il piano originale approvato)
-              e non cambia anche quando si eseguono nuovi scheduling.
+          {/* Date */}
+          <div className="border border-border rounded-lg p-3 space-y-2 bg-muted/30">
+            <p className="text-xs font-semibold text-foreground">Data di inizio e data target</p>
+            <p className="text-foreground/70 text-xs leading-relaxed">
+              <strong className="text-foreground">Data di inizio scheduling</strong>: punto zero del solver CP-SAT.
+              Utile per simulare scenari futuri ("se iniziassimo il 1° luglio…") o rieseguire
+              scheduling storici. Se omessa, si usa la data odierna.
+            </p>
+            <p className="text-foreground/70 text-xs leading-relaxed">
+              <strong className="text-foreground">Data target (FINISH_BY_DATE)</strong>: il solver CP-SAT
+              minimizza il ritardo rispetto a questa data. Se i vincoli rendono impossibile
+              rispettare la scadenza, il risultato sarà INFEASIBLE con spiegazione dettagliata.
             </p>
           </div>
+
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Modal: Nuovo Scenario ─────────────────────────────────────────────────────
+
+// ── Componente Report Scheduling ─────────────────────────────────────────────
+
+function SchedulingReport({ summary, scenarioName }: {
+  summary: ScheduleRunSummary;
+  scenarioName?: string;
+}) {
+  const fmtDate = (iso: string | null) => iso
+    ? new Date(iso).toLocaleDateString('it-IT', { day: '2-digit', month: 'short', year: 'numeric' })
+    : '—';
+  const fmtDateTime = (iso: string | null) => iso
+    ? new Date(iso).toLocaleString('it-IT', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })
+    : '—';
+  const fmtMin = (min: number) => {
+    const days = Math.floor(min / 480);
+    const hours = Math.round((min % 480) / 60);
+    return days > 0 ? `${days}g ${hours}h` : `${Math.round(min / 60)}h`;
+  };
+
+  const statusColor = summary.solver_status === 'OPTIMAL'
+    ? 'text-green-400 bg-green-900/20 border-green-700/30'
+    : summary.solver_status === 'FEASIBLE'
+      ? 'text-blue-400 bg-blue-900/20 border-blue-700/30'
+      : 'text-red-400 bg-red-900/20 border-red-700/30';
+
+  const coverage = summary.total_schedulable_ops > 0
+    ? Math.round((summary.scheduled_ops / summary.total_schedulable_ops) * 100)
+    : 0;
+
+  const loadPct = summary.total_capacity_minutes > 0
+    ? Math.round((summary.total_work_minutes / summary.total_capacity_minutes) * 100)
+    : null;
+
+  const objectiveLabels: Record<string, string> = {
+    FINISH_BY_DATE: 'Finisci entro data target',
+    MAXIMIZE_RESOURCE_UTILIZATION: 'Massimizza utilizzo risorse',
+    MINIMIZE_OPERATORS: 'Minimizza gruppi risorsa',
+    CUSTOM: 'Solo makespan',
+    FEASIBILITY: 'Soddisfacibilità pura',
+  };
+
+  const engineLabels: Record<string, string> = {
+    greedy: 'Greedy (CP-SAT non ha migliorato)',
+    cpsat: 'CP-SAT ottimizzato',
+  };
+
+  const triggerLabels: Record<string, string> = {
+    api: 'Avviato manualmente via UI',
+    manual: 'Avviato manualmente',
+  };
+  const triggerLabel = summary.triggered_by?.startsWith('delay_event:')
+    ? `Evento ritardo (${summary.triggered_by.split(':')[1]?.slice(0, 8)}…)`
+    : (triggerLabels[summary.triggered_by] ?? summary.triggered_by ?? '—');
+
+  return (
+    <div className="space-y-4 text-sm">
+      {scenarioName && (
+        <p className="text-xs text-muted-foreground">Scenario: <span className="text-foreground font-medium">{scenarioName}</span></p>
+      )}
+
+      {/* Status + contesto run */}
+      <div className={`flex items-start gap-3 p-3 border rounded-lg ${statusColor}`}>
+        <div className="text-2xl font-bold mt-0.5">
+          {summary.solver_status === 'OPTIMAL' ? '✓' : summary.solver_status === 'FEASIBLE' ? '~' : '✕'}
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="font-semibold">
+            {summary.solver_status === 'OPTIMAL' ? 'Soluzione ottimale trovata'
+              : summary.solver_status === 'FEASIBLE' ? 'Soluzione fattibile trovata'
+              : 'Soluzione non trovata (INFEASIBLE)'}
+          </p>
+          <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-xs opacity-80 mt-1">
+            <span>Risolto in {summary.solve_time_seconds != null ? `${summary.solve_time_seconds}s` : '—'}</span>
+            <span>Motore: {summary.engine_used ? engineLabels[summary.engine_used] ?? summary.engine_used : '—'}</span>
+            <span>Obiettivo: {objectiveLabels[summary.objective_mode] ?? summary.objective_mode}</span>
+            <span>Trigger: {triggerLabel}</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Finestra temporale + KPI principali */}
+      <div className="grid grid-cols-2 gap-3">
+        <div className="border border-border rounded-lg p-3 space-y-1">
+          <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground mb-2">
+            <Calendar size={12} /> Finestra temporale
+          </div>
+          <div className="text-xs space-y-0.5">
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Inizio scheduling:</span>
+              <span className="font-medium">{fmtDate(summary.schedule_start_date)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Horizon solver:</span>
+              <span className="font-medium">{fmtDate(summary.horizon_date)}</span>
+            </div>
+            {summary.earliest_start && (
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Prima op inizia:</span>
+                <span className="font-medium">{fmtDateTime(summary.earliest_start)}</span>
+              </div>
+            )}
+            {summary.latest_end && (
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Ultima op finisce:</span>
+                <span className="font-medium">{fmtDateTime(summary.latest_end)}</span>
+              </div>
+            )}
+            {summary.makespan_days != null && (
+              <div className="flex justify-between border-t border-border pt-1 mt-1">
+                <span className="text-muted-foreground">Durata totale:</span>
+                <span className="font-bold text-foreground">{summary.makespan_days} giorni lavorativi</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="border border-border rounded-lg p-3 space-y-1">
+          <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground mb-2">
+            <Database size={12} /> Operazioni
+          </div>
+          <div className="text-xs space-y-0.5">
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Totale schedulabili:</span>
+              <span className="font-medium">{summary.total_schedulable_ops}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Schedulate:</span>
+              <span className="font-medium text-green-400">{summary.scheduled_ops}</span>
+            </div>
+            {summary.in_progress_anchored > 0 && (
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">IN_PROGRESS (ancorate a ora):</span>
+                <span className="font-medium text-blue-400">{summary.in_progress_anchored}</span>
+              </div>
+            )}
+            {summary.orphan_ops_count > 0 && (
+              <div className="flex justify-between text-amber-400">
+                <span>Senza operatori qualificati:</span>
+                <span className="font-medium">{summary.orphan_ops_count}</span>
+              </div>
+            )}
+            {summary.impossible_ops_count > 0 && (
+              <div className="flex justify-between text-red-400">
+                <span>Impossibili (oltre horizon):</span>
+                <span className="font-medium">{summary.impossible_ops_count}</span>
+              </div>
+            )}
+            <div className="pt-1.5">
+              <div className="flex justify-between text-[10px] mb-1">
+                <span className="text-muted-foreground">Copertura</span>
+                <span className="font-bold">{coverage}%</span>
+              </div>
+              <div className="h-1.5 bg-muted rounded-full overflow-hidden">
+                <div
+                  className={`h-full rounded-full ${coverage === 100 ? 'bg-green-500' : coverage > 80 ? 'bg-blue-500' : 'bg-amber-500'}`}
+                  style={{ width: `${coverage}%` }}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Carico vs Capacità */}
+        <div className="border border-border rounded-lg p-3 space-y-1">
+          <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground mb-2">
+            <Zap size={12} /> Carico vs Capacità operatori
+          </div>
+          <div className="text-xs space-y-0.5">
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Lavoro totale da schedulare:</span>
+              <span className="font-medium">{summary.total_work_minutes != null ? fmtMin(summary.total_work_minutes) : '—'}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Capacità totale disponibile:</span>
+              <span className="font-medium">{summary.total_capacity_minutes != null ? fmtMin(summary.total_capacity_minutes) : '—'}</span>
+            </div>
+            {loadPct != null && (
+              <div className="pt-1.5">
+                <div className="flex justify-between text-[10px] mb-1">
+                  <span className="text-muted-foreground">Saturazione capacità</span>
+                  <span className={`font-bold ${loadPct > 100 ? 'text-red-400' : loadPct > 80 ? 'text-amber-400' : 'text-green-400'}`}>{loadPct}%</span>
+                </div>
+                <div className="h-1.5 bg-muted rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full ${loadPct > 100 ? 'bg-red-500' : loadPct > 80 ? 'bg-amber-500' : 'bg-green-500'}`}
+                    style={{ width: `${Math.min(loadPct, 100)}%` }}
+                  />
+                </div>
+                {loadPct > 100 && (
+                  <p className="text-[10px] text-red-400 mt-1">La capacità disponibile è inferiore al lavoro richiesto — la soluzione può essere solo FEASIBLE, non OPTIMAL.</p>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Operatori */}
+        <div className="border border-border rounded-lg p-3 space-y-1">
+          <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground mb-2">
+            <Users size={12} /> Operatori
+          </div>
+          <div className="text-xs space-y-0.5">
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Attivi nel sistema:</span>
+              <span className="font-medium">{summary.operators_total}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Con turni nel periodo:</span>
+              <span className="font-medium">{summary.operators_with_slots}</span>
+            </div>
+            {summary.operators_total - summary.operators_with_slots > 0 && (
+              <div className="flex justify-between text-amber-400">
+                <span>Senza turni (esclusi):</span>
+                <span className="font-medium">{summary.operators_total - summary.operators_with_slots}</span>
+              </div>
+            )}
+            {summary.operators_used != null && (
+              <div className="flex justify-between border-t border-border pt-1 mt-1">
+                <span className="text-muted-foreground">Effettivamente assegnati:</span>
+                <span className="font-bold text-foreground">{summary.operators_used}</span>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Workcenter breakdown */}
+      {summary.workcenter_breakdown?.length > 0 && (
+        <div className="border border-border rounded-lg p-3">
+          <p className="text-xs font-semibold text-muted-foreground mb-2">Matching operatori ↔ workcenter</p>
+          <div className="space-y-1.5">
+            {summary.workcenter_breakdown.map((wc) => {
+              const ratio = wc.operators_available === 0 ? 0 : Math.min(wc.operators_available / Math.max(wc.ops_count / 5, 1), 1);
+              const hasGap = wc.operators_available === 0;
+              return (
+                <div key={wc.workcenter_id} className={`flex items-center gap-2 text-xs rounded px-2 py-1 ${hasGap ? 'bg-red-900/20 border border-red-700/30' : 'bg-muted/30'}`}>
+                  <code className="font-mono text-[10px] text-muted-foreground w-32 truncate shrink-0">{wc.workcenter_id.slice(0, 8)}…</code>
+                  <span className="text-muted-foreground shrink-0">{wc.ops_count} op</span>
+                  <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
+                    <div className={`h-full rounded-full ${hasGap ? 'bg-red-500' : 'bg-blue-500'}`} style={{ width: `${Math.round(ratio * 100)}%` }} />
+                  </div>
+                  <span className={`font-medium shrink-0 ${hasGap ? 'text-red-400' : ''}`}>{wc.operators_available} op.</span>
+                  {hasGap && <span className="text-red-400 text-[10px]">⚠ nessun operatore</span>}
+                </div>
+              );
+            })}
+          </div>
+          <p className="text-[10px] text-muted-foreground mt-2">La barra mostra il rapporto tra operatori disponibili e volume di lavoro nel workcenter. Un workcenter senza operatori genera operazioni orphan non schedulabili.</p>
+        </div>
+      )}
+
+      {/* Vincoli CP-SAT applicati */}
+      <div className="border border-border rounded-lg p-3">
+        <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground mb-2">
+          <Link size={12} /> Vincoli CP-SAT applicati
+        </div>
+        <div className="grid grid-cols-2 gap-x-6 gap-y-0.5 text-xs">
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Precedenza rami BOM (Tipo B):</span>
+            <span className="font-medium">{summary.rp_order_constraints_count}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Padre aspetta figli (Tipo A):</span>
+            <span className="font-medium">{summary.parent_wait_constraints_count}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Blocchi componenti mancanti:</span>
+            <span className={`font-medium ${summary.missing_constraints_active > 0 ? 'text-amber-400' : ''}`}>
+              {summary.missing_constraints_active}
+            </span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-muted-foreground">Totale vincoli attivi:</span>
+            <span className="font-medium">
+              {summary.rp_order_constraints_count + summary.parent_wait_constraints_count + summary.missing_constraints_active}
+            </span>
+          </div>
+        </div>
+        <div className="mt-2 space-y-1 text-[10px] text-muted-foreground border-t border-border pt-2">
+          <p><strong className="text-foreground">Tipo B</strong>: impongono l'ordine di montaggio tra rami paralleli della BOM (es. struttura portante deve finire prima che inizi l'idraulico).</p>
+          <p><strong className="text-foreground">Tipo A</strong>: ogni operazione padre aspetta il 100% dei figli (es. collaudo finale aspetta tutti i sottoaggregati).</p>
+          {summary.missing_constraints_active > 0 && (
+            <p className="text-amber-400"><strong>Componenti mancanti</strong>: {summary.missing_constraints_active} operazioni bloccate fino all'arrivo del materiale — queste non possono iniziare prima della data attesa.</p>
+          )}
+        </div>
+      </div>
+
+      {/* Conflitti (se INFEASIBLE) */}
+      {summary.conflicts.length > 0 && (
+        <div className="border border-red-600/30 bg-red-900/10 rounded-lg p-3">
+          <div className="flex items-center gap-1.5 text-xs font-semibold text-red-400 mb-2">
+            <AlertTriangle size={12} /> Motivi dell'INFEASIBLE
+          </div>
+          <ul className="space-y-1">
+            {summary.conflicts.map((c, i) => (
+              <li key={i} className="text-xs text-red-300/80 pl-3 border-l-2 border-red-800">{c}</li>
+            ))}
+          </ul>
+          <p className="text-[10px] text-red-300/60 mt-2">Suggerimento: verifica la disponibilità degli operatori nel calendario, rimuovi blocchi su componenti già arrivati, oppure estendi l'horizon dello scenario.</p>
+        </div>
+      )}
+
+      {/* Warning non bloccanti */}
+      {(summary.orphan_ops_count > 0 || summary.impossible_ops_count > 0) && summary.conflicts.length === 0 && (
+        <div className="border border-amber-600/30 bg-amber-900/10 rounded-lg p-3 text-xs space-y-1">
+          <div className="flex items-center gap-1.5 font-semibold text-amber-400 mb-1">
+            <AlertTriangle size={12} /> Avvisi (soluzione trovata ma incompleta)
+          </div>
+          {summary.orphan_ops_count > 0 && (
+            <p className="text-amber-300/80"><strong>{summary.orphan_ops_count} operazioni orphan</strong>: nessun operatore qualificato per quel workcenter nel periodo — aggiungi operatori al calendario o verifica le skill.</p>
+          )}
+          {summary.impossible_ops_count > 0 && (
+            <p className="text-amber-300/80"><strong>{summary.impossible_ops_count} operazioni impossibili</strong>: la durata residua supera l'horizon disponibile — estendi la data di orizzonte dello scenario.</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Modal report scheduling ───────────────────────────────────────────────────
+
+function SchedulingReportModal({ summary, scenarioName, onClose }: {
+  summary: ScheduleRunSummary;
+  scenarioName: string;
+  onClose: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div
+        className="bg-background border border-border rounded-xl p-6 max-w-2xl w-full max-h-[90vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-5">
+          <h2 className="text-base font-bold">Report Scheduling</h2>
+          <button onClick={onClose} className="text-muted-foreground hover:text-foreground">✕</button>
+        </div>
+        <SchedulingReport summary={summary} scenarioName={scenarioName} />
       </div>
     </div>
   );
@@ -358,6 +810,7 @@ function NewScenarioModal({
   const qc = useQueryClient();
   const [name, setName] = useState('');
   const [objective, setObjective] = useState<string>('FINISH_BY_DATE');
+  const [startDate, setStartDate] = useState('');
   const [targetDate, setTargetDate] = useState('');
   const [state, setState] = useState<'idle' | 'creating' | 'scheduling' | 'done'>('idle');
   const [taskId, setTaskId] = useState<string | null>(null);
@@ -376,6 +829,7 @@ function NewScenarioModal({
         name: name.trim(),
         machine_order_id: machineOrderId,
         objective_mode: objective,
+        start_date: startDate || null,
         target_finish_date: objective === 'FINISH_BY_DATE' && targetDate ? targetDate : null,
         is_active: false,
         is_baseline: false,
@@ -392,7 +846,7 @@ function NewScenarioModal({
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={onClose}>
       <div
-        className="bg-background border border-border rounded-xl p-6 max-w-lg w-full"
+        className="bg-background border border-border rounded-xl p-6 max-w-lg w-full max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-5">
@@ -441,21 +895,57 @@ function NewScenarioModal({
                         {meta.label}
                       </div>
                       <p className="text-xs text-muted-foreground mt-0.5">{meta.description}</p>
+                      {objective === key && (
+                        <p className="text-[10px] text-muted-foreground/70 mt-1 italic">{meta.detail}</p>
+                      )}
                     </div>
                   </label>
                 ))}
               </div>
             </div>
 
-            {objective === 'FINISH_BY_DATE' && (
+            {/* Data di partenza — disponibile per tutti gli obiettivi */}
+            <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block text-xs font-medium mb-1">Data target di completamento</label>
+                <label className="block text-xs font-medium mb-1">
+                  Data di inizio scheduling
+                  <span className="ml-1 text-muted-foreground font-normal">(opzionale)</span>
+                </label>
                 <input
                   type="date"
-                  value={targetDate}
-                  onChange={(e) => setTargetDate(e.target.value)}
+                  value={startDate}
+                  onChange={(e) => setStartDate(e.target.value)}
                   className="w-full px-3 py-2 text-sm border border-border rounded bg-background focus:outline-none focus:ring-1 focus:ring-primary"
                 />
+                <p className="text-[10px] text-muted-foreground mt-1">
+                  Se vuoto, usa la data odierna
+                </p>
+              </div>
+
+              {objective === 'FINISH_BY_DATE' && (
+                <div>
+                  <label className="block text-xs font-medium mb-1">
+                    Data target di completamento
+                    <span className="ml-1 text-red-400 font-normal">*</span>
+                  </label>
+                  <input
+                    type="date"
+                    value={targetDate}
+                    min={startDate || undefined}
+                    onChange={(e) => setTargetDate(e.target.value)}
+                    className="w-full px-3 py-2 text-sm border border-border rounded bg-background focus:outline-none focus:ring-1 focus:ring-primary"
+                  />
+                  <p className="text-[10px] text-muted-foreground mt-1">
+                    Il solver vincola il makespan a questa data
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {objective === 'FINISH_BY_DATE' && !targetDate && (
+              <div className="border border-amber-600/30 bg-amber-900/10 rounded p-2 text-amber-300 text-xs">
+                Inserire una data target per il vincolo FINISH_BY_DATE.
+                Senza data il solver minimizza il makespan senza limite temporale.
               </div>
             )}
 
@@ -869,67 +1359,24 @@ export default function ScenarioManager() {
       )}
  
       {lastRunResult && (lastRunResult.solver_status === 'OPTIMAL' || lastRunResult.solver_status === 'FEASIBLE') && (
-        <div className="border border-green-600/40 bg-green-950/20 rounded-xl p-4">
-          <div className="flex items-center gap-3">
-            <CheckCircle size={18} className="text-green-400" />
-            <div>
-              <p className="text-sm font-medium text-green-300">
-                Scheduling completato ({lastRunResult.solver_status === 'OPTIMAL' ? 'ottimale' : 'fattibile'})
-              </p>
-              <p className="text-xs text-green-400/70 mt-0.5">
-                {lastRunResult.makespan_days != null && `Durata: ${lastRunResult.makespan_days} giorni`}
-                {lastRunResult.operators_used != null && ` · ${lastRunResult.operators_used} operatori`}
+        <div className="border border-green-600/40 bg-green-950/10 rounded-xl p-5">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <CheckCircle size={16} className="text-green-400" />
+              <p className="text-sm font-semibold text-green-300">
+                Scheduling {lastRunResult.solver_status === 'OPTIMAL' ? 'ottimale' : 'fattibile'} completato
               </p>
             </div>
-            <button
-              onClick={() => setLastRunResult(null)}
-              className="ml-auto text-xs text-green-400/60 hover:text-green-300"
-            >
-              ✕
-            </button>
+            <button onClick={() => setLastRunResult(null)} className="text-muted-foreground hover:text-foreground text-sm">✕</button>
           </div>
-        </div>
-      )}
-
-      {/* Banner risultato ultimo scheduling */}
-      {lastRunResult?.solver_status === 'INFEASIBLE' && (
-        <div className="border border-red-600/40 bg-red-950/20 rounded-xl p-5">
-          <div className="flex items-start gap-3">
-            <span className="text-red-400 text-lg mt-0.5">✕</span>
-            <div className="flex-1">
-              <p className="text-sm font-semibold text-red-300 mb-1">Soluzione non fattibile</p>
-              <p className="text-xs text-red-400/80 leading-relaxed">
-                Il solver CP-SAT non ha trovato una schedulazione valida con i vincoli attuali.
-                Possibili cause: operatori insufficienti nel workcenter, finestra temporale
-                troppo stretta, o componenti mancanti che bloccano troppe operazioni.
-              </p>
-              {lastRunResult.conflicts && lastRunResult.conflicts.length > 0 && (
-                <div className="mt-3 space-y-1">
-                  <p className="text-xs font-medium text-red-300">Dettagli conflitti:</p>
-                  {lastRunResult.conflicts.map((c, i) => (
-                    <p key={i} className="text-xs text-red-400/70 pl-3 border-l-2 border-red-800">{c}</p>
-                  ))}
-                </div>
-              )}
-            </div>
-            <button onClick={() => setLastRunResult(null)} className="text-red-400/60 hover:text-red-300 text-sm">✕</button>
-          </div>
-        </div>
-      )}
-
-      {lastRunResult?.solver_status && ['OPTIMAL', 'FEASIBLE'].includes(lastRunResult.solver_status) && (
-        <div className="border border-green-600/40 bg-green-950/10 rounded-xl p-4 flex items-center gap-3">
-          <CheckCircle size={18} className="text-green-400 shrink-0" />
-          <div className="flex-1">
-            <p className="text-sm font-medium text-green-300">
-              Scheduling {lastRunResult.solver_status === 'OPTIMAL' ? 'ottimale' : 'fattibile'} completato
-            </p>
-            <p className="text-xs text-green-400/70 mt-0.5">
+          {lastRunResult.summary ? (
+            <SchedulingReport summary={lastRunResult.summary} />
+          ) : (
+            <p className="text-xs text-green-400/70">
               {lastRunResult.makespan_days != null && `Durata: ${lastRunResult.makespan_days} giorni`}
-              {lastRunResult.operators_used != null && ` · ${lastRunResult.operators_used} operatori utilizzati`}
+              {lastRunResult.operators_used != null && ` · ${lastRunResult.operators_used} operatori`}
             </p>
-          </div>
-          <button onClick={() => setLastRunResult(null)} className="text-green-400/60 hover:text-green-300 text-sm">✕</button>
+          )}
         </div>
       )}
 

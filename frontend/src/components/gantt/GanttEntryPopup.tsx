@@ -47,7 +47,7 @@ export default function GanttEntryPopup({ entry, onClose, onOverride }: GanttEnt
 
       {/* Fields */}
       <dl className="space-y-1">
-        <Row label="Operatore" value={entry.operator_name} />
+        <Row label="Risorsa" value={entry.operator_name} />
         <Row label="Start" value={fmt(entry.start)} />
         <Row label="Fine" value={fmt(entry.end)} />
         <Row label="Durata" value={`${durationMinutes} min`} />

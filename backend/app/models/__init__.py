@@ -7,6 +7,7 @@ from app.models.missing import MissingComponent
 from app.models.operator import Operator, OperatorCalendar, Shift
 from app.models.production import ProductionOrder, ZOrdersLink
 from app.models.reference import ReferencePoint, ReferencePointPrecedence
+from app.models.resource import ResourceType
 from app.models.routing import Operation, Routing
 from app.models.schedule import ScheduleEntry, ScheduleScenario
 from app.models.workcenter import SkillWorkcenterMapping, Workcenter
@@ -29,6 +30,7 @@ __all__ = [
     "Operator",
     "Shift",
     "OperatorCalendar",
+    "ResourceType",
     "MissingComponent",
     "ScheduleScenario",
     "ScheduleEntry",

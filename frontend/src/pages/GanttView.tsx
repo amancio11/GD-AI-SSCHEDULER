@@ -123,7 +123,7 @@ export default function GanttView() {
           onClick={() => setGanttViewMode('BY_OPERATOR')}
           className={`px-3 py-1 ${ganttViewMode === 'BY_OPERATOR' ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'}`}
         >
-          Operatore
+          Risorsa
         </button>
         <button
           onClick={() => setGanttViewMode('BY_ORDER')}

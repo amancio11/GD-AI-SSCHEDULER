@@ -8,6 +8,13 @@ import { triggerToast } from '../hooks/useToast';
 import type { DelayEvent, DelayEventType, DelayImpactResponse } from '../api/types';
 import { Plus, X, AlertTriangle, Bot, CheckCircle2 } from 'lucide-react';
 
+interface OperationFlat {
+  operation_id: string;
+  operation_description: string;
+  production_order_material: string;
+  entry_status: string;
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const URGENCY_COLORS = {
@@ -39,20 +46,43 @@ const TYPE_LABELS: Record<DelayEventType, string> = {
 
 interface NewDelayModalProps {
   machineOrderId: string;
+  activeScenarioId: string | null;
   onClose: () => void;
 }
 
-function NewDelayModal({ machineOrderId, onClose }: NewDelayModalProps) {
+function NewDelayModal({ machineOrderId, activeScenarioId, onClose }: NewDelayModalProps) {
   const qc = useQueryClient();
   const { data: operators = [] } = useOperators();
   const now = new Date().toISOString().slice(0, 16);
 
-  const [type, setType]     = useState<DelayEventType>('OPERATOR_ABSENCE');
-  const [from, setFrom]     = useState(now);
-  const [until, setUntil]   = useState(now);
-  const [desc, setDesc]     = useState('');
-  const [opId, setOpId]     = useState('');
+  const [type, setType]         = useState<DelayEventType>('OPERATOR_ABSENCE');
+  const [from, setFrom]         = useState(now);
+  const [until, setUntil]       = useState(now);
+  const [desc, setDesc]         = useState('');
+  const [entityId, setEntityId] = useState('');
   const [reschedule, setReschedule] = useState(true);
+
+  // Carica operazioni dallo scenario attivo quando il tipo è MANUAL_OPERATION_DELAY
+  const { data: operationsFlat = [], isLoading: opsLoading } = useQuery<OperationFlat[]>({
+    queryKey: ['operations-flat', activeScenarioId],
+    queryFn: async () => {
+      const { data } = await apiClient.get<OperationFlat[]>(
+        `/api/gantt/${activeScenarioId}/operations-flat`
+      );
+      return data;
+    },
+    enabled: type === 'MANUAL_OPERATION_DELAY' && !!activeScenarioId,
+  });
+
+  // Deduplicata per operation_id (una stessa op può avere più entries)
+  const uniqueOps = operationsFlat.filter(
+    (op, idx, arr) => arr.findIndex((o) => o.operation_id === op.operation_id) === idx
+  );
+
+  const affectedEntityType =
+    type === 'OPERATOR_ABSENCE' ? 'operator'
+    : type === 'MANUAL_OPERATION_DELAY' ? 'operation'
+    : null;
 
   const createMutation = useMutation({
     mutationFn: () =>
@@ -64,8 +94,8 @@ function NewDelayModal({ machineOrderId, onClose }: NewDelayModalProps) {
         description: desc,
         reported_at: new Date().toISOString(),
         requires_reschedule: reschedule,
-        affected_entity_id: opId || null,
-        affected_entity_type: opId ? 'operator' : null,
+        affected_entity_id: entityId || null,
+        affected_entity_type: entityId ? affectedEntityType : null,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['delays', machineOrderId] });
@@ -74,9 +104,15 @@ function NewDelayModal({ machineOrderId, onClose }: NewDelayModalProps) {
     },
   });
 
+  // Reset entity selection when type changes
+  function handleTypeChange(t: DelayEventType) {
+    setType(t);
+    setEntityId('');
+  }
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="bg-card border border-border rounded-xl shadow-2xl p-6 w-[460px] text-sm">
+      <div className="bg-card border border-border rounded-xl shadow-2xl p-6 w-[480px] text-sm">
         <div className="flex justify-between mb-4">
           <h2 className="text-base font-semibold">Nuovo Ritardo</h2>
           <button onClick={onClose}><X size={16} /></button>
@@ -89,27 +125,56 @@ function NewDelayModal({ machineOrderId, onClose }: NewDelayModalProps) {
             <div className="space-y-1">
               {(['OPERATOR_ABSENCE', 'COMPONENT_DELAY', 'MANUAL_OPERATION_DELAY', 'OTHER'] as DelayEventType[]).map((t) => (
                 <label key={t} className="flex items-center gap-2 text-xs cursor-pointer">
-                  <input type="radio" name="type" value={t} checked={type === t} onChange={() => setType(t)} />
+                  <input type="radio" name="type" value={t} checked={type === t} onChange={() => handleTypeChange(t)} />
                   {TYPE_LABELS[t]}
                 </label>
               ))}
             </div>
           </div>
 
-          {/* Operator selector (only for OPERATOR_ABSENCE) */}
+          {/* Operator selector (OPERATOR_ABSENCE) */}
           {type === 'OPERATOR_ABSENCE' && (
             <div>
               <label className="block text-xs font-medium mb-1">Operatore</label>
               <select
-                value={opId}
-                onChange={(e) => setOpId(e.target.value)}
-                className="w-full border border-border rounded px-2 py-1.5 bg-background"
+                value={entityId}
+                onChange={(e) => setEntityId(e.target.value)}
+                className="w-full border border-border rounded px-2 py-1.5 bg-background text-xs"
               >
-                <option value="">Seleziona…</option>
+                <option value="">Seleziona operatore…</option>
                 {operators.map((op) => (
                   <option key={op.id} value={op.id}>{op.full_name} ({op.skill})</option>
                 ))}
               </select>
+            </div>
+          )}
+
+          {/* Operation selector (MANUAL_OPERATION_DELAY) */}
+          {type === 'MANUAL_OPERATION_DELAY' && (
+            <div>
+              <label className="block text-xs font-medium mb-1">Operazione</label>
+              {!activeScenarioId ? (
+                <p className="text-xs text-amber-500 bg-amber-500/10 border border-amber-500/30 rounded px-2 py-1.5">
+                  Nessuno scenario attivo. Attiva uno scenario prima di registrare un ritardo su un'operazione.
+                </p>
+              ) : opsLoading ? (
+                <p className="text-xs text-muted-foreground">Caricamento operazioni…</p>
+              ) : uniqueOps.length === 0 ? (
+                <p className="text-xs text-muted-foreground">Nessuna operazione schedulata nello scenario attivo.</p>
+              ) : (
+                <select
+                  value={entityId}
+                  onChange={(e) => setEntityId(e.target.value)}
+                  className="w-full border border-border rounded px-2 py-1.5 bg-background text-xs"
+                >
+                  <option value="">Seleziona operazione…</option>
+                  {uniqueOps.map((op) => (
+                    <option key={op.operation_id} value={op.operation_id}>
+                      [{op.production_order_material}] {op.operation_description} — {op.entry_status}
+                    </option>
+                  ))}
+                </select>
+              )}
             </div>
           )}
 
@@ -150,11 +215,11 @@ function NewDelayModal({ machineOrderId, onClose }: NewDelayModalProps) {
         )}
 
         <div className="flex gap-2 mt-4">
-          <button onClick={onClose} className="flex-1 py-1.5 border border-border rounded hover:bg-accent">Annulla</button>
+          <button onClick={onClose} className="flex-1 py-1.5 border border-border rounded hover:bg-accent text-xs">Annulla</button>
           <button
             onClick={() => createMutation.mutate()}
             disabled={createMutation.isPending}
-            className="flex-1 py-1.5 bg-primary text-primary-foreground rounded hover:opacity-90 disabled:opacity-50"
+            className="flex-1 py-1.5 bg-primary text-primary-foreground rounded hover:opacity-90 disabled:opacity-50 text-xs"
           >
             {createMutation.isPending ? 'Creando…' : 'Crea ritardo'}
           </button>
@@ -388,7 +453,11 @@ export default function DelayManager() {
       )}
 
       {showNew && selectedMachineOrderId && (
-        <NewDelayModal machineOrderId={selectedMachineOrderId} onClose={() => setShowNew(false)} />
+        <NewDelayModal
+          machineOrderId={selectedMachineOrderId}
+          activeScenarioId={activeScenarioId}
+          onClose={() => setShowNew(false)}
+        />
       )}
       {impactDelay && (
         <ImpactModal delay={impactDelay} scenarioId={activeScenarioId} onClose={() => setImpactDelay(null)} />

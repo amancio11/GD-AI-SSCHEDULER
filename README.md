@@ -2,7 +2,16 @@
 
 Sistema di schedulazione intelligente per il montaggio di macchine industriali complesse, con integrazione mock SAP Digital Manufacturing.
 
-- Motore di scheduling: **OR-Tools CP-SAT** (ottimizzazione a vincoli)
+> **⚠️ AGGIORNAMENTO 2026-06-26 — CP-SAT cumulativo a capacità di gruppo.** Lo scheduling usa
+> **OR-Tools CP-SAT** sul modello a **capacità di gruppo**: le risorse sono **tipi**
+> `(workcenter, skill, ore/giorno, count)`, non individui. Ogni gruppo è una risorsa `AddCumulative`
+> con capacità = `count` (≤ count operazioni in parallelo); le operazioni si spezzano su più giorni;
+> obiettivo `Minimize(makespan)` / `makespan ≤ target`. Motore: `backend/app/core/scheduler/capacity_cpsat.py`
+> (un'euristica greedy fornisce warm-start e fallback). Il vecchio modello CP-SAT a **segmenti
+> per-operatore** era intrattabile (UNKNOWN su 240+ op: simmetria + NoOverlap su migliaia di intervalli);
+> i riferimenti a quel modello più sotto sono **storici**.
+
+- Motore di scheduling: **OR-Tools CP-SAT cumulativo a capacità di gruppo** (RCPSP)
 - AI: **Anthropic Claude Sonnet 4.6**
 - Task asincroni: **Celery 5 + Redis 7**
 - Database: **PostgreSQL 16**
@@ -95,6 +104,44 @@ docker compose exec backend bash
 # Rieseguire il seed dopo modifiche
 docker compose exec backend python -m app.db.seed
 ```
+
+> ⚠️ Il `docker-compose.yml` storico non include il servizio **worker Celery** né lo
+> step di migrazione: con quello, la rischedulazione (`reschedule_incremental.delay`)
+> non parte. Per un deploy in container completo usa **Podman** (Opzione 1-bis), il cui
+> `podman-compose.yml` include `worker`, `migrate` e `seed`.
+
+---
+
+## OPZIONE 1-bis — Avvio con Podman (senza Docker, rootless)
+
+Adatto a chi non può/non vuole usare Docker (es. PC senza privilegi admin). Podman è
+**rootless e daemonless**. Lo stack è completo: postgres, redis, migrate, backend,
+**worker Celery**, frontend, e seed opt-in.
+
+### Prerequisiti
+- [Podman Desktop](https://podman-desktop.io/) installato (include `podman` e `podman compose`)
+- Macchina Podman avviata (Windows/macOS, una-tantum): `podman machine init && podman machine start`
+- Progetto sotto la home utente (per i bind-mount del codice)
+
+### Avvio (script)
+```powershell
+.\start-podman.ps1            # build + avvio di tutti i container
+.\start-podman.ps1 -Seed      # avvia E popola i dati mock (primo avvio)
+.\start-podman.ps1 -Down      # ferma (il DB nel volume resta)
+```
+
+### Avvio (manuale)
+```bash
+podman compose -f podman-compose.yml up -d --build
+podman compose -f podman-compose.yml --profile seed run --rm seed   # seed (primo avvio)
+podman compose -f podman-compose.yml logs -f backend worker
+podman compose -f podman-compose.yml down                           # stop
+podman compose -f podman-compose.yml down -v                        # stop + cancella DB
+```
+
+Frontend → http://localhost:5173 · Backend/docs → http://localhost:8000/docs
+
+Dettagli, note SELinux/`:Z`, override URL e troubleshooting: **GUIDA_TECNICA.md §17**.
 
 ---
 
@@ -298,12 +345,20 @@ Start-Process "http://localhost:8000/docs"  # Swagger UI
 ## Flusso operativo — Come usare il sistema
 
 1. Apri il **frontend** → http://localhost:5173
-2. Vai su **Scenario Manager** → crea un nuovo scenario scegliendo obiettivo (es. `FINISH_BY_DATE`) e data target
+2. Vai su **Scenario Manager** → crea un nuovo scenario:
+   - Scegli l'**obiettivo** (`FINISH_BY_DATE`, `MINIMIZE_OPERATORS`, `MAXIMIZE_RESOURCE_UTILIZATION`, `CUSTOM`)
+   - (Opzionale) Imposta la **data di inizio scheduling** — se omessa usa la data odierna
+   - Se l'obiettivo è `FINISH_BY_DATE`, imposta la **data target di completamento** (vincolo duro per il solver)
 3. Clicca **Crea e Schedula** → il task viene inviato a Celery che avvia il solver CP-SAT
 4. Il badge WebSocket in header si aggiorna quando lo scheduling è completato (5–60 sec)
 5. Vai su **Gantt View** → visualizza il piano per operatore o per ordine di produzione
 6. Vai su **AI Assistant** → chiedi spiegazioni, analisi ritardi, confronto scenari
 7. Usa **Export** → scarica il piano in CSV (Excel), JSON-SAP o PDF
+
+**Quando rischedulare**: dopo ogni evento che cambia la capacità disponibile o i vincoli
+(ritardo operatore, componente mancante sbloccato, operazione completata in ritardo).
+Il solver riprende da dove si è fermato: le operazioni `COMPLETED` sono escluse, le
+operazioni `IN_PROGRESS` vengono ancorata alla loro progressione attuale.
 
 ---
 
@@ -316,6 +371,7 @@ Start-Process "http://localhost:8000/docs"  # Swagger UI
 | `ANTHROPIC_API_KEY` | Chiave API Anthropic — [ottienila qui](https://console.anthropic.com/) | — |
 | `CPSAT_TIMEOUT_SECONDS` | Timeout massimo del solver CP-SAT | `60` |
 | `MIN_OP_DURATION_MINUTES` | Durata minima di un'operazione schedulata | `30` |
+| `DELAY_RESCHEDULE_THRESHOLD_MINUTES` | Ritardo minimo per innescare reschedule automatico | `15` |
 | `ENVIRONMENT` | `development` o `production` | `development` |
 | `VITE_API_URL` | URL del backend visto dal browser | `http://localhost:8000` |
 | `VITE_WS_URL` | URL WebSocket visto dal browser | `ws://localhost:8000` |
@@ -331,11 +387,12 @@ gd-scheduler/
 │   │   ├── api/routes/        # FastAPI routers (orders, schedule, ai, export, …)
 │   │   ├── core/
 │   │   │   ├── ai/            # Claude client, prompt builder, context extractor
-│   │   │   └── scheduler/     # CP-SAT engine, DAG builder, shift preprocessor
-│   │   ├── models/            # SQLAlchemy models (19 tabelle)
+│   │   │   ├── scheduler/     # CP-SAT engine, DAG builder, shift preprocessor, reschedule
+│   │   │   └── state_engine/  # State machine, CPM, rollup BOM, propagazione ritardi
+│   │   ├── models/            # SQLAlchemy models (20 tabelle)
 │   │   ├── schemas/           # Pydantic v2 schemas
 │   │   └── db/                # Session async, seed script TURBOPRESS-X500
-│   ├── alembic/               # Migrazioni database
+│   ├── alembic/               # Migrazioni database (5 migration)
 │   ├── celery_worker.py       # Configurazione app Celery
 │   └── requirements.txt
 ├── frontend/
@@ -645,59 +702,6 @@ Start-Process "http://localhost:5173"
 
 ---
 
-## Flusso operativo — Come usare il sistema
-
-1. Apri il **frontend** → http://localhost:5173
-2. Vai su **Scenario Manager** → crea un nuovo scenario scegliendo obiettivo (es. `FINISH_BY_DATE`) e data target
-3. Clicca **Crea e Schedula** → Celery worker riceve il task e avvia il solver CP-SAT
-4. Il badge WebSocket in alto si aggiorna quando lo scheduling è completato (in genere 5–60 secondi)
-5. Vai su **Gantt View** → visualizza il piano per operatore o per ordine
-6. Vai su **AI Assistant** → chiedi spiegazioni, analisi ritardi, suggerimenti di ottimizzazione
-7. Usa **Export** → scarica il piano in CSV (Excel), JSON-SAP o PDF
-
----
-
-## Variabili d'ambiente
-
-| Variabile | Descrizione | Default |
-|---|---|---|
-| `DATABASE_URL` | PostgreSQL connection string (asyncpg) | `postgresql+asyncpg://scheduler:scheduler@localhost:5432/scheduler` |
-| `REDIS_URL` | Redis broker URL | `redis://localhost:6379/0` |
-| `ANTHROPIC_API_KEY` | Chiave API Anthropic — [ottienila qui](https://console.anthropic.com/) | — |
-| `CPSAT_TIMEOUT_SECONDS` | Tempo massimo solver CP-SAT per scenario | `60` |
-| `MIN_OP_DURATION_MINUTES` | Durata minima di un'operazione schedulata | `30` |
-| `ENVIRONMENT` | `development` o `production` | `development` |
-| `VITE_API_URL` | URL del backend visto dal browser | `http://localhost:8000` |
-| `VITE_WS_URL` | URL WebSocket visto dal browser | `ws://localhost:8000` |
-
----
-
-## Struttura del progetto
-
-```
-gd-scheduler/
-├── backend/
-│   ├── app/
-│   │   ├── api/routes/        # FastAPI routers (orders, schedule, ai, export, …)
-│   │   ├── core/
-│   │   │   ├── ai/            # Claude client, prompt builder, context extractor
-│   │   │   └── scheduler/     # CP-SAT engine, DAG builder, shift preprocessor
-│   │   ├── models/            # SQLAlchemy models (19 tabelle)
-│   │   ├── schemas/           # Pydantic v2 schemas
-│   │   └── db/                # Session async, seed script TURBOPRESS-X500
-│   ├── alembic/               # Migrazioni database
-│   ├── celery_worker.py       # Configurazione app Celery
-│   └── requirements.txt
-├── frontend/
-│   └── src/
-│       ├── pages/             # Dashboard, Gantt, BOM, Calendar, AI, Export, …
-│       ├── components/        # Layout, Gantt, BOM, AI sidebar
-│       ├── api/               # Axios client + React Query hooks
-│       └── store/             # Zustand stores (schedule, operator, ai, ui)
-├── docker-compose.yml
-├── start-local.ps1            # Script avvio locale Windows
-└── .env.example
-```
 
 ---
 

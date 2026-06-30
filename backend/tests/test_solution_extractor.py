@@ -41,11 +41,9 @@ def _make_vars(
 
     op_start = {op.id: intvar(start_minutes[op.id]) for op in ops}
     op_end   = {op.id: intvar(end_minutes[op.id])   for op in ops}
-    op_interval = {}
     op_duration = {op.id: end_minutes[op.id] - start_minutes[op.id] for op in ops}
 
     assignments = {}
-    opt_intervals = {}
     for op in ops:
         for oper_id in oper_ids:
             bv = MagicMock()
@@ -55,10 +53,8 @@ def _make_vars(
     return CpsatVariables(
         op_start=op_start,
         op_end=op_end,
-        op_interval=op_interval,
         op_duration=op_duration,
         assignments=assignments,
-        operator_optional_intervals=opt_intervals,
     )
 
 

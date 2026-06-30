@@ -62,7 +62,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str) -> None:
 # (configurato su VITE_API_URL) possa chiamare /api/<resource>.
 # I tag corrispondono alle sezioni della documentazione OpenAPI (/docs).
 from app.api.routes import orders, operators, reference_points, delays, missing_components
-from app.api.routes import export, ai, admin
+from app.api.routes import export, ai, admin, resources
 from app.api.routes.schedule import router as scenarios_router, schedule_router
 from app.api.routes.dag import router as dag_router
 from app.api.routes.gantt import router as gantt_router
@@ -82,6 +82,10 @@ app.include_router(schedule_router, prefix=API_PREFIX)
 
 # Operatori, turni, calendario disponibilità
 app.include_router(operators.router, prefix=API_PREFIX)
+
+# Tipi risorsa (capacità di gruppo) — config "calendario risorse"
+app.include_router(resources.router, prefix=API_PREFIX)
+app.include_router(resources.workcenters_router, prefix=API_PREFIX)
 
 # Reference point e DAG precedenze
 app.include_router(reference_points.router, prefix=API_PREFIX)
