@@ -450,31 +450,35 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
         for op_sc in schedulable_ops:
             ops_by_order[op_sc.production_order_id].append(op_sc.id)
 
-        # ── rp_direct_pairs: vincoli HARD diretti tra op con reference_point_id ──
+        # ── rp_direct_pairs: priorità SOFT intra-routing tra op con reference_point_id ──
         # Ogni operazione con reference_point_id è un'op di "integrazione/assemblaggio"
         # che referenzia un nodo specifico del DAG RP. Per ogni arco RP_pred → RP_succ,
-        # l'op con RP_pred deve finire prima che l'op con RP_succ inizi.
-        # Questo è il vincolo hard che deriva ESCLUSIVAMENTE dal RP DAG.
+        # l'op con RP_pred ha PRIORITÀ DI DISPATCH più alta dell'op con RP_succ.
         #
-        # Bypass naturale con componenti mancanti:
-        # Le op foglia (GROUP) non hanno reference_point_id → nessun vincolo hard RP su di loro.
-        # Se un GROUP ha earliest_start alto (componente mancante), le altre op lavorano
-        # liberamente; solo l'op di integrazione (con reference_point_id) rispetta l'ordine RP.
-        rp_to_op_id: dict[uuid.UUID, uuid.UUID] = {}
+        # ATTENZIONE: questo NON è un vincolo hard. rp_direct_pairs NON entra in
+        # _build_preds()/_preds(): alimenta solo `intra_routing_depth` → `op_priority`.
+        # Se l'op RP_pred è bloccata (componente mancante), l'op RP_succ può comunque
+        # lavorare; con risorse libere le due op possono partire in parallelo.
+        # L'unico vincolo bloccante resta la BOM (parent_wait_constraints).
+        #
+        # Un RP può essere referenziato da più operazioni: raccogliamo TUTTE le op
+        # per RP (no last-wins) così nessun arco di priorità viene perso.
+        rp_to_op_ids: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
         for _op_r, _routing_r, _po_r in ops_rows:
             if _op_r.id in schedulable_op_ids and _op_r.reference_point_id:
-                rp_to_op_id[_op_r.reference_point_id] = _op_r.id
+                rp_to_op_ids[_op_r.reference_point_id].append(_op_r.id)
 
         rp_direct_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
         for prec_d in prec_rows:
-            _pred_op = rp_to_op_id.get(prec_d.predecessor_reference_point_id)
-            _succ_op = rp_to_op_id.get(prec_d.reference_point_id)
-            if _pred_op and _succ_op:
-                rp_direct_pairs.append((_pred_op, _succ_op))
+            _pred_ops = rp_to_op_ids.get(prec_d.predecessor_reference_point_id, [])
+            _succ_ops = rp_to_op_ids.get(prec_d.reference_point_id, [])
+            for _pred_op in _pred_ops:
+                for _succ_op in _succ_ops:
+                    rp_direct_pairs.append((_pred_op, _succ_op))
 
         precedence_pairs[:] = rp_direct_pairs   # sovrascrive la lista vuota di Step 4b
         logger.info(
-            "Step 4d: %d archi RP DAG → %d rp_direct_pairs (vincoli hard op diretti con RP)",
+            "Step 4d: %d archi RP DAG → %d rp_direct_pairs (priorità SOFT intra-routing)",
             len(prec_rows), len(rp_direct_pairs),
         )
 
@@ -690,8 +694,16 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
     if use_cpsat and greedy_result.status == "OPTIMAL" and greedy_result.makespan_minutes:
         from app.core.scheduler.capacity_cpsat import CapacityCpsatScheduler
 
-        margin = float(_os.getenv("CPSAT_CAPACITY_HORIZON_MARGIN", "1.5"))
-        cpsat_horizon = min(horizon, int(greedy_result.makespan_minutes * margin) + 1440)
+        # Orizzonte CP-SAT: il makespan del greedy è un upper bound VALIDO dell'ottimo
+        # per i modi che minimizzano il makespan → usiamo H = makespan_greedy + 1 giorno
+        # (dominio stretto = CP-SAT molto più veloce, meno blocker calendario).
+        # MINIMIZE_OPERATORS può invece ALLUNGARE il makespan (concentra il lavoro su
+        # meno gruppi) → serve margine, altrimenti tagliamo via soluzioni valide.
+        if objective_mode == "MINIMIZE_OPERATORS":
+            margin = float(_os.getenv("CPSAT_CAPACITY_HORIZON_MARGIN", "1.5"))
+            cpsat_horizon = min(horizon, int(greedy_result.makespan_minutes * margin) + 1440)
+        else:
+            cpsat_horizon = min(horizon, int(greedy_result.makespan_minutes) + 1440)
         target_min: int | None = None
         if scenario.target_finish_date:
             _tdt = datetime(
@@ -708,10 +720,18 @@ def _run_reschedule(session: Session, scenario_id: uuid.UUID, triggered_by: str)
             rp_order_constraints=rp_order_constraints,
             parent_wait_constraints=parent_wait_constraints,
             missing_constraints=missing_constraints,
+            op_priority=op_priority,
             objective_mode=objective_mode,
             target_finish_minutes=target_min,
-            timeout_seconds=float(_os.getenv("CPSAT_CAPACITY_TIMEOUT", "30")),
+            timeout_seconds=float(_os.getenv("CPSAT_CAPACITY_TIMEOUT", "60")),
             warm_start=greedy_result,
+            # Granularità temporale del modello CP-SAT (bucket in minuti). Default 1 =
+            # precisione al minuto. Knob SPERIMENTALE: alzarlo rimpicciolisce i DOMINI
+            # ma NON la struttura (n. di intervalli/cumulative) — sulle istanze grandi
+            # non aiuta la ricerca e rende l'incumbent del greedy non più esattamente
+            # fattibile in spazio-bucket. Ciò che rende CP-SAT affidabile qui è il
+            # warm-start completo + fix-to-hint, non il bucketing. Vedi SCHEDULER_CONSTRAINTS §4.5.2.
+            bucket_minutes=int(_os.getenv("CPSAT_CAPACITY_BUCKET_MIN", "1")),
         ).solve()
         if cpsat_result.status in ("OPTIMAL", "FEASIBLE") and cpsat_result.entries:
             cap_result = cpsat_result

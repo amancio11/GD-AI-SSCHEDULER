@@ -319,6 +319,46 @@ async def run_scenario(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Reschedule — alias semantico di /run, usato dalle sezioni che modificano i dati
+# (componenti mancanti, ritardi, risorse, operazioni). Stessa pipeline incrementale
+# di reschedule_incremental: ricarica mancanti/risorse/op aggiornati e riottimizza,
+# preservando le IN_PROGRESS e ripulendo le entries STALE.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _trigger_reschedule(scenario_id: uuid.UUID, db: AsyncSession, triggered_by: str) -> dict:
+    obj = await db.get(ScheduleScenario, scenario_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="Scenario non trovato")
+    from app.core.scheduler.scheduler_orchestrator import run_schedule
+    task_id = run_schedule(scenario_id, triggered_by=triggered_by, use_celery=True)
+    return {"status": "queued", "task_id": task_id, "scenario_id": str(scenario_id)}
+
+
+@router.post("/{scenario_id}/reschedule", status_code=202)
+async def reschedule_scenario(
+    scenario_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Rischedula incrementalmente lo scenario dopo un aggiornamento dati.
+
+    Idempotente: ricostruisce il piano a partire dallo stato corrente del DB
+    (componenti mancanti, risorse attive, durate/avanzamenti delle operazioni),
+    ancorando le operazioni IN_PROGRESS a "ora". Risposta 202: gira in background,
+    l'esito arriva via WebSocket `RESCHEDULE_COMPLETE` / `SCHEDULE_INFEASIBLE`.
+    """
+    return await _trigger_reschedule(scenario_id, db, triggered_by="reschedule-api")
+
+
+@schedule_router.post("/scenario/{scenario_id}/reschedule", status_code=202)
+async def reschedule_scenario_alias(
+    scenario_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Alias di compatibilità per il path storico `/api/schedule/scenario/{id}/reschedule`."""
+    return await _trigger_reschedule(scenario_id, db, triggered_by="reschedule-api")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Task status — polling per il frontend
 # ─────────────────────────────────────────────────────────────────────────────
 
